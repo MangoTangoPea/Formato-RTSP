@@ -6,6 +6,7 @@ Uso:
 """
 import socket
 import struct
+import ssl
 import argparse
 import numpy as np
 import cv2
@@ -22,10 +23,19 @@ def recvall(sock: socket.socket, n: int) -> bytes:
     return bytes(data)
 
 
-def receive_and_show(host: str, port: int) -> None:
+def receive_and_show(host: str, port: int, secure: bool, cafile: str) -> None:
     while True:
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            if secure:
+                context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
+                if cafile:
+                    context.load_verify_locations(cafile)
+                else:
+                    context.check_hostname = False
+                    context.verify_mode = ssl.CERT_NONE
+                    print('Advertencia: TLS activo pero sin verificación de certificado (usar --cafile para verificar).')
+                sock = context.wrap_socket(sock, server_hostname=host)
             print(f"Conectando a {host}:{port} ...")
             sock.connect((host, port))
             print('Conectado.')
@@ -68,9 +78,11 @@ def main():
     p = argparse.ArgumentParser(description='Cliente de vídeo TCP')
     p.add_argument('--host', required=True, help='IP del servidor')
     p.add_argument('--port', type=int, default=8000, help='Puerto (por defecto 8000)')
+    p.add_argument('--secure', action='store_true', help='Usar TLS/SSL para proteger la conexión')
+    p.add_argument('--cafile', default='', help='Ruta al certificado CA o certificado del servidor para verificar la conexión')
     args = p.parse_args()
 
-    receive_and_show(args.host, args.port)
+    receive_and_show(args.host, args.port, args.secure, args.cafile)
 
 
 if __name__ == '__main__':

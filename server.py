@@ -9,10 +9,11 @@ Conecta con el cliente en la otra máquina: el cliente recibirá y mostrará ví
 import socket
 import struct
 import argparse
+import ssl
 import cv2
 
 
-def send_frames(host: str, port: int, cam: int, quality: int) -> None:
+def send_frames(host: str, port: int, cam: int, quality: int, secure: bool, certfile: str, keyfile: str) -> None:
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sock.bind((host, port))
@@ -21,6 +22,17 @@ def send_frames(host: str, port: int, cam: int, quality: int) -> None:
 
     conn, addr = sock.accept()
     print(f"Conexión entrante desde {addr}")
+
+    if secure:
+        if not certfile or not keyfile:
+            print('ERROR: secure requiere --certfile y --keyfile')
+            conn.close()
+            sock.close()
+            return
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.load_cert_chain(certfile, keyfile)
+        conn = context.wrap_socket(conn, server_side=True)
+        print('Conexión segura establecida con TLS')
 
     cap = cv2.VideoCapture(cam)
     if not cap.isOpened():
@@ -60,9 +72,12 @@ def main():
     p.add_argument('--port', type=int, default=8000, help='Puerto (por defecto 8000)')
     p.add_argument('--cam', type=int, default=0, help='Índice de la cámara (por defecto 0)')
     p.add_argument('--quality', type=int, default=80, help='Calidad JPEG 0-100 (por defecto 80)')
+    p.add_argument('--secure', action='store_true', help='Usar TLS/SSL para asegurar la conexión')
+    p.add_argument('--certfile', default='cert.pem', help='Ruta al certificado TLS (solo si --secure)')
+    p.add_argument('--keyfile', default='key.pem', help='Ruta a la llave privada TLS (solo si --secure)')
     args = p.parse_args()
 
-    send_frames(args.host, args.port, args.cam, args.quality)
+    send_frames(args.host, args.port, args.cam, args.quality, args.secure, args.certfile, args.keyfile)
 
 
 if __name__ == '__main__':
