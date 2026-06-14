@@ -61,16 +61,37 @@ Adaptador de Ethernet:
 Para que el receptor pueda encontrar al emisor, **ambas máquinas deben estar en la misma red local (WiFi o cable)**. Usa este comando en el **receptor** para verificar que ve al emisor:
 
 ```powershell
-ping 192.168.1.42
+ping 192.168.0.9
 ```
 
 Reemplaza `192.168.0.9` con la IP real del emisor.
 
-Si ves mensajes como `Reply from 192.168.0.9`, significa que están conectadas. ✓
+Si ves mensajes como `Reply from 192.168.0.9`, significa que la red funciona. ✓
 
-Si ves `Timed out` o `no se alcanzó el host`, significa que no se ven. En ese caso:
+Si ves `Timed out` o `no se alcanzó el host`, significa que las máquinas no se ven. En ese caso:
 1. Verifica que ambas máquinas estén en la misma red WiFi o cable.
-2. Desactiva el firewall de Windows temporalmente (Control Panel > Windows Defender Firewall > Turn off).
+2. Comprueba que estás usando la IP correcta del emisor.
+3. Desactiva el firewall de Windows temporalmente para probar.
+
+### Verificar el puerto TCP 9999
+
+A veces el ping funciona pero la conexión TCP no. Esto ocurre cuando el puerto está bloqueado o el emisor no está realmente escuchando.
+
+En el **receptor**, ejecuta:
+
+```powershell
+Test-NetConnection 192.168.0.9 -Port 9999
+```
+
+Si ves `TcpTestSucceeded : False`, entonces el puerto no está abierto desde el emisor hacia el receptor. Sigue estos pasos:
+1. Asegúrate de que el emisor está corriendo y dice `Escuchando en 0.0.0.0:9999 ...`.
+2. Si el emisor no está corriendo, inicia:
+   ```powershell
+   python emisor.py 0.0.0.0 9999
+   ```
+3. Si el emisor está corriendo pero el puerto sigue cerrado, permite Python en el firewall o desactiva el firewall temporalmente.
+
+Si el emisor está en la misma máquina que ejecuta la prueba, `SourceAddress` y `RemoteAddress` serán iguales. Para comprobar bien la conexión, haz la prueba desde la otra computadora.
 
 ## Cómo ejecutar
 
