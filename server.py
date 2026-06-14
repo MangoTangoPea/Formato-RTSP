@@ -10,75 +10,88 @@ import socket
 import struct
 import argparse
 import ssl
+import socket
+import struct
 import cv2
+import time
+import sys
 
+# Configuración de red
+HOST = '0.0.0.0'  # Escuchar en todas las interfaces
+PORT = 9999       # Puerto a usar (puede cambiarse)
 
-def send_frames(host: str, port: int, cam: int, quality: int, secure: bool, certfile: str, keyfile: str) -> None:
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    sock.bind((host, port))
-    sock.listen(1)
-    print(f"Escuchando en {host}:{port} ...")
-
-    conn, addr = sock.accept()
-    print(f"Conexión entrante desde {addr}")
-
-    if secure:
-        if not certfile or not keyfile:
-            print('ERROR: secure requiere --certfile y --keyfile')
-            conn.close()
-            sock.close()
-            return
-        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-        context.load_cert_chain(certfile, keyfile)
-        conn = context.wrap_socket(conn, server_side=True)
-        print('Conexión segura establecida con TLS')
-
-    cap = cv2.VideoCapture(cam)
+def start_server(host=HOST, port=PORT):
+    # Crear objeto de captura de video (cámara por defecto)
+    cap = cv2.VideoCapture(0)
     if not cap.isOpened():
-        print("No se pudo abrir la cámara")
-        conn.close()
-        sock.close()
+        print("Error: no se pudo abrir la cámara.")
         return
+
+    # Crear socket TCP y preparar para aceptar conexiones
+    server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server_socket.bind((host, port))
+    server_socket.listen(1)
+    print(f"Escuchando en {host}:{port} ...")
 
     try:
         while True:
-            ret, frame = cap.read()
-            if not ret:
-                break
+            # Esperar a que un cliente se conecte
+            conn, addr = server_socket.accept()
+            print(f"Conexión desde {addr}")
+            try:
+                # Bucle principal: capturar y enviar marcos continuamente
+                while True:
+                    ret, frame = cap.read()
+                    if not ret:
+                        # Si falla la lectura, esperar un momento y reintentar
+                        time.sleep(0.1)
+                        continue
 
-            # Codificar frame como JPEG
-            encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), quality]
-            result, encoded = cv2.imencode('.jpg', frame, encode_param)
-            if not result:
-                continue
+                    # Codificar el marco a JPEG para reducir tamaño
+                    # El tercer parámetro es la calidad JPEG (0-100)
+                    encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), 80]
+                    result, encoded_image = cv2.imencode('.jpg', frame, encode_param)
+                    if not result:
+                        # Si la codificación falla, saltar este marco
+                        continue
 
-            data = encoded.tobytes()
-            # Enviar longitud (4 bytes, network order) + datos
-            length = struct.pack('!I', len(data))
-            conn.sendall(length + data)
-
-    except Exception as e:
-        print('Error:', e)
+                    data = encoded_image.tobytes()
+                    # Enviar primero 4 bytes con el tamaño del bloque (big-endian)
+                    size = struct.pack('!I', len(data))
+                    try:
+                        # Enviar tamaño + datos del marco
+                        conn.sendall(size + data)
+                    except (BrokenPipeError, ConnectionResetError):
+                        # El cliente se desconectó inesperadamente
+                        print("Cliente desconectado.")
+                        break
+                    # Pequeña pausa opcional para evitar saturar la red/cpu
+                    time.sleep(0.01)
+            except Exception as e:
+                # Cualquier excepción del bucle de conexión se registra
+                print(f"Error durante la transmisión: {e}")
+            finally:
+                # Cerrar la conexión actual y volver a esperar otra
+                try:
+                    conn.shutdown(socket.SHUT_RDWR)
+                except Exception:
+                    pass
+                conn.close()
+                print("Conexión cerrada, esperando nuevo cliente...")
+    except KeyboardInterrupt:
+        # Permitir terminar el servidor con Ctrl+C
+        print("\nServidor detenido por el usuario.")
     finally:
+        # Liberar recursos: cámara y socket del servidor
         cap.release()
-        conn.close()
-        sock.close()
-
-
-def main():
-    p = argparse.ArgumentParser(description='Servidor de vídeo TCP (envía frames JPEG)')
-    p.add_argument('--host', default='0.0.0.0', help='IP para enlazar (por defecto 0.0.0.0)')
-    p.add_argument('--port', type=int, default=8000, help='Puerto (por defecto 8000)')
-    p.add_argument('--cam', type=int, default=0, help='Índice de la cámara (por defecto 0)')
-    p.add_argument('--quality', type=int, default=80, help='Calidad JPEG 0-100 (por defecto 80)')
-    p.add_argument('--secure', action='store_true', help='Usar TLS/SSL para asegurar la conexión')
-    p.add_argument('--certfile', default='cert.pem', help='Ruta al certificado TLS (solo si --secure)')
-    p.add_argument('--keyfile', default='key.pem', help='Ruta a la llave privada TLS (solo si --secure)')
-    args = p.parse_args()
-
-    send_frames(args.host, args.port, args.cam, args.quality, args.secure, args.certfile, args.keyfile)
-
+        server_socket.close()
+        print("Recursos liberados, servidor finalizado.")
 
 if __name__ == '__main__':
-    main()
+    # Permitir pasar host y puerto por argumentos opcionales
+    if len(sys.argv) >= 2:
+        HOST = sys.argv[1]
+    if len(sys.argv) >= 3:
+        PORT = int(sys.argv[2])
+    start_server(HOST, PORT)
