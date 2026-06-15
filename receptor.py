@@ -63,6 +63,9 @@ def iniciar_receptor(ip_emisor=IP_EMISOR, puerto_emisor=PUERTO_EMISOR):
                     # Si la decodificación falla, saltar este fotograma
                     continue
 
+                # Voltear la imagen (rotación 180 grados)
+                fotograma = cv2.flip(fotograma, -1)
+
                 # Mostrar el fotograma en una ventana
                 cv2.imshow('Video en directo (presione q para salir)', fotograma)
                 # Salir si el usuario presiona 'q'
