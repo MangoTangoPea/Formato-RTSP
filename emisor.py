@@ -38,12 +38,22 @@ import zipfile
 import shutil
 import urllib.request
 
+# ─── Configurar la codificación de la consola para Unicode en Windows ─────
+# Evita UnicodeEncodeError al imprimir caracteres como ═, ✓, ✗, ⚠, etc.
+if sys.platform.startswith("win"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stderr.reconfigure(encoding="utf-8")
+    except AttributeError:
+        pass
+
+
 # ─── Intentar importar OpenCV ─────────────────────────────────────────────
 try:
     import cv2
 except ImportError:
     print("Error: opencv-python no está instalado.")
-    print("  Instálalo con:  pip install opencv-python")
+    print("  Instálalo con:  pip install -r requirements.txt")
     sys.exit(1)
 
 # ─── Intentar importar numpy ──────────────────────────────────────────────
@@ -51,7 +61,17 @@ try:
     import numpy as np
 except ImportError:
     print("Error: numpy no está instalado.")
-    print("  Instálalo con:  pip install numpy")
+    print("  Instálalo con:  pip install -r requirements.txt")
+    sys.exit(1)
+
+# ─── Intentar importar imageio_ffmpeg ─────────────────────────────────────
+# Este paquete incluye un binario estático de FFmpeg que se instala vía pip,
+# eliminando la necesidad de instalar FFmpeg manualmente en el sistema.
+try:
+    import imageio_ffmpeg
+except ImportError:
+    print("Error: imageio-ffmpeg no está instalado.")
+    print("  Instálalo con:  pip install -r requirements.txt")
     sys.exit(1)
 
 
@@ -81,26 +101,37 @@ MEDIAMTX_URL = (
 # FUNCIONES AUXILIARES
 # ═══════════════════════════════════════════════════════════════════════════
 
-def verificar_ffmpeg():
+def obtener_ruta_ffmpeg():
     """
-    Verifica que FFmpeg esté instalado y accesible en el PATH del sistema.
-    FFmpeg es necesario para codificar el vídeo en H.264 y enviarlo al
-    servidor RTSP mediante el protocolo RTP empaquetado en contenedor RTSP.
+    Obtiene la ruta al ejecutable de FFmpeg usando imageio-ffmpeg.
+    Este paquete instala un binario estático de FFmpeg dentro del entorno
+    virtual de Python, por lo que no es necesario instalar FFmpeg
+    manualmente en el sistema operativo.
 
-    Retorna True si FFmpeg está disponible, False en caso contrario.
+    imageio_ffmpeg.get_ffmpeg_exe() busca FFmpeg en este orden:
+      1. Variable de entorno IMAGEIO_FFMPEG_EXE (si está definida)
+      2. Binario incluido en el paquete imageio-ffmpeg (instalado vía pip)
+      3. Instalación del sistema (PATH) como respaldo
+
+    Retorna la ruta completa al ejecutable de FFmpeg, o None si no se encuentra.
     """
     try:
-        # Ejecutar 'ffmpeg -version' para verificar su existencia
+        # Obtener la ruta al binario de FFmpeg incluido en imageio-ffmpeg
+        ruta = imageio_ffmpeg.get_ffmpeg_exe()
+
+        # Verificar que el binario funcione ejecutando 'ffmpeg -version'
         resultado = subprocess.run(
-            ["ffmpeg", "-version"],
+            [ruta, "-version"],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             creationflags=subprocess.CREATE_NO_WINDOW if platform.system() == "Windows" else 0
         )
-        return resultado.returncode == 0
-    except FileNotFoundError:
-        # FFmpeg no se encontró en el PATH
-        return False
+        if resultado.returncode == 0:
+            return ruta
+        return None
+    except Exception:
+        # Si imageio_ffmpeg no encuentra el binario, lanza RuntimeError
+        return None
 
 
 def descargar_mediamtx():
@@ -301,15 +332,14 @@ def iniciar_emisor(indice_camara=0, puerto=PUERTO_RTSP_DEFECTO, bitrate_kbps=200
         print("  EMISOR RTSP — Transmisión de cámara local")
         print("═" * 60)
 
-        print("\n[1/4] Verificando FFmpeg ...")
-        if not verificar_ffmpeg():
-            print("  ✗ FFmpeg no está instalado o no está en el PATH.")
-            print("  Para instalar FFmpeg en Windows:")
-            print("    1. Descarga desde: https://www.gyan.dev/ffmpeg/builds/")
-            print("    2. Extrae y añade la carpeta 'bin' al PATH del sistema")
-            print("    3. Reinicia la terminal")
+        print("\n[1/4] Verificando FFmpeg (vía imageio-ffmpeg) ...")
+        ruta_ffmpeg = obtener_ruta_ffmpeg()
+        if ruta_ffmpeg is None:
+            print("  ✗ No se pudo obtener el binario de FFmpeg.")
+            print("  Asegúrate de haber instalado las dependencias:")
+            print("    pip install -r requirements.txt")
             sys.exit(1)
-        print("  ✓ FFmpeg encontrado")
+        print(f"  ✓ FFmpeg encontrado: {ruta_ffmpeg}")
 
         # ─── Paso 2: Iniciar el servidor MediaMTX ─────────────────────
         print(f"\n[2/4] Preparando servidor RTSP (MediaMTX) ...")
@@ -370,7 +400,7 @@ def iniciar_emisor(indice_camara=0, puerto=PUERTO_RTSP_DEFECTO, bitrate_kbps=200
         # -rtsp_transport tcp  → Usar TCP para el transporte RTSP (más fiable en LAN)
         # {url_rtsp}           → URL de destino en el servidor MediaMTX
         comando_ffmpeg = [
-            "ffmpeg",
+            ruta_ffmpeg,                    # Ruta al binario de FFmpeg (vía imageio-ffmpeg)
             "-y",                           # Sobrescribir sin preguntar
             "-f", "rawvideo",               # Formato de entrada: vídeo crudo
             "-vcodec", "rawvideo",          # Códec de entrada: sin compresión

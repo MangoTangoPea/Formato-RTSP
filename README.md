@@ -39,7 +39,7 @@ Sistema de transmisión de vídeo tipo cliente-servidor que funciona en red loca
 | **`emisor.py`** | Publicador RTSP | Captura la cámara con OpenCV, envía frames crudos a FFmpeg vía stdin. FFmpeg codifica en H.264 y publica al servidor MediaMTX. |
 | **`receptor.py`** | Cliente RTSP | Se conecta a la URL RTSP, recibe paquetes RTP, decodifica H.264 y muestra el vídeo en una ventana OpenCV. |
 | **MediaMTX** | Servidor RTSP | Servidor ligero que redistribuye el flujo a múltiples clientes. Se descarga automáticamente al ejecutar el emisor. |
-| **FFmpeg** | Codificador | Convierte vídeo crudo BGR a H.264 y lo empaqueta en RTSP/RTP. Debe instalarse manualmente. |
+| **FFmpeg** | Codificador | Convierte vídeo crudo BGR a H.264 y lo empaqueta en RTSP/RTP. Se incluye automáticamente mediante `imageio-ffmpeg`. |
 
 ---
 
@@ -50,31 +50,16 @@ Sistema de transmisión de vídeo tipo cliente-servidor que funciona en red loca
 | Requisito | Versión mínima | Cómo verificar | Instalación |
 |-----------|---------------|-----------------|-------------|
 | Python | 3.8+ | `python --version` | [python.org](https://www.python.org/downloads/) |
-| FFmpeg | 4.0+ | `ffmpeg -version` | Ver sección abajo |
+| FFmpeg | 4.0+ | (Gestionado automáticamente por `imageio-ffmpeg`) | Se instala automáticamente vía `pip install -r requirements.txt` |
 | pip | (incluido con Python) | `pip --version` | — |
 
 > **Nota:** MediaMTX se descarga **automáticamente** la primera vez que ejecutas `emisor.py`. No necesitas instalarlo manualmente.
 
-### Instalar FFmpeg en Windows
+### Gestión automática de FFmpeg
 
-FFmpeg es un programa externo que se debe descargar e instalar manualmente:
+En este proyecto, **no necesitas instalar FFmpeg manualmente en Windows ni configurar variables de entorno (PATH)**. 
 
-1. Ve a [https://www.gyan.dev/ffmpeg/builds/](https://www.gyan.dev/ffmpeg/builds/)
-2. Descarga **ffmpeg-release-essentials.zip** (la versión "essentials" es suficiente)
-3. Extrae el ZIP en una ubicación permanente, por ejemplo: `C:\ffmpeg`
-4. Añade la carpeta `bin` al PATH del sistema:
-
-```powershell
-# Verificar que FFmpeg funcione:
-ffmpeg -version
-```
-
-**Para añadir FFmpeg al PATH permanentemente:**
-
-1. Busca "Variables de entorno" en el menú de inicio de Windows
-2. En "Variables del sistema", busca `Path` y haz clic en "Editar"
-3. Haz clic en "Nuevo" y añade la ruta: `C:\ffmpeg\bin` (ajusta según dónde lo extrajiste)
-4. Acepta y reinicia la terminal
+El sistema utiliza la dependencia de Python `imageio-ffmpeg`, la cual descarga e instala automáticamente un binario ejecutable estático de FFmpeg dentro del entorno virtual (`.venv`). Esto asegura un funcionamiento listo para usar ("out of the box") sin intervenciones manuales del usuario.
 
 ### Dependencias de Python
 
@@ -86,8 +71,9 @@ pip install -r requirements.txt
 ```
 
 Las dependencias de Python son:
-- **`opencv-python`**: captura de cámara, decodificación H.264, y visualización de vídeo
-- **`numpy`**: manipulación de arrays de píxeles (requerido por OpenCV)
+- **`opencv-python`**: captura de cámara, decodificación H.264 y visualización de vídeo.
+- **`numpy`**: manipulación de arrays de píxeles (requerido por OpenCV).
+- **`imageio-ffmpeg`**: proporciona y gestiona el binario ejecutable de FFmpeg dentro del entorno de Python de forma automática.
 
 Para salir del entorno virtual:
 
@@ -288,15 +274,13 @@ Puedes probar el flujo RTSP con cualquier reproductor compatible. En VLC:
 
 ## Resolución de problemas comunes
 
-### "FFmpeg no está instalado o no está en el PATH"
+### "FFmpeg no está instalado o no se encuentra"
 
-**Causa:** FFmpeg no se encontró en las variables de entorno del sistema.
+**Causa:** El entorno virtual no se activó correctamente o no se han instalado las dependencias de Python.
 
 **Solución:**
-1. Descarga FFmpeg desde [gyan.dev/ffmpeg/builds](https://www.gyan.dev/ffmpeg/builds/)
-2. Extrae en `C:\ffmpeg`
-3. Añade `C:\ffmpeg\bin` al PATH del sistema
-4. Reinicia la terminal y verifica con `ffmpeg -version`
+1. Asegúrate de activar el entorno virtual con `.\.venv\Scripts\Activate.ps1`.
+2. Asegúrate de ejecutar `pip install -r requirements.txt` para instalar `imageio-ffmpeg` y el resto de dependencias.
 
 ### "No se pudo abrir la cámara"
 

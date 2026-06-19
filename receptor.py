@@ -36,6 +36,15 @@ import time
 import argparse
 import os
 
+# ─── Configurar la codificación de la consola para Unicode en Windows ─────
+# Evita UnicodeEncodeError al imprimir caracteres como ═, ✓, ✗, ⚠, etc.
+if sys.platform.startswith("win"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stderr.reconfigure(encoding="utf-8")
+    except AttributeError:
+        pass
+
 # ─── Intentar importar OpenCV ─────────────────────────────────────────────
 try:
     import cv2
