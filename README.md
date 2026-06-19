@@ -1,13 +1,82 @@
-# Demo RTSP (Emisor/Receptor local)
+# Demo RTSP — Transmisión de vídeo con protocolo RTSP real (Emisor / Receptor)
 
-Proyecto mínimo para transmitir vídeo desde una cámara (emisor) a un receptor en la red local.
+Sistema de transmisión de vídeo tipo cliente-servidor que funciona en red local entre dos computadoras utilizando el protocolo **RTSP** (Real Time Streaming Protocol, RFC 2326).
 
-## Requisitos
+## Arquitectura del sistema
 
-- Python 3.8+
-- dependencias listadas en `requirements.txt` (`opencv-python`, `numpy`)
+```
+  ┌──────────┐   frames crudos   ┌─────────┐   RTSP/RTP    ┌──────────┐
+  │  Cámara  │ ────────────────► │ FFmpeg  │ ────────────► │ MediaMTX │
+  │ (OpenCV) │   vía pipe/stdin  │ (H.264) │  ANNOUNCE +   │ (server  │
+  │          │                   │         │  RECORD        │  RTSP)   │
+  └──────────┘                   └─────────┘               └────┬─────┘
+     emisor.py                                                  │
+                                                      rtsp://<IP>:8554/camara
+                                                                │
+                                                           ┌────▼─────┐
+                                                           │ Receptor │
+                                                           │ (OpenCV) │
+                                                           └──────────┘
+                                                            receptor.py
+```
 
-## Preparar entorno virtual (Windows PowerShell)
+### ¿Qué es RTSP?
+
+**RTSP** (Real Time Streaming Protocol) es un protocolo de capa de aplicación diseñado para controlar la entrega de datos en tiempo real. A diferencia de HTTP, RTSP no transporta los datos multimedia directamente — usa **RTP** (Real-time Transport Protocol) para eso.
+
+**Analogía simple:** RTSP es como el control remoto de un reproductor de vídeo: le dices "play", "pause", "stop". RTP es el cable que lleva el vídeo real.
+
+| Protocolo | Función | Transporte | Puerto por defecto |
+|-----------|---------|------------|-------------------|
+| RTSP      | Señalización (DESCRIBE, SETUP, PLAY, TEARDOWN) | TCP | 554 / 8554 |
+| RTP       | Transporte de paquetes de vídeo H.264 | UDP o TCP entrelazado | Negociado en SETUP |
+| RTCP      | Control de calidad (informes de recepción) | UDP | RTP + 1 |
+
+### Componentes
+
+| Componente | Rol | Descripción |
+|------------|-----|-------------|
+| **`emisor.py`** | Publicador RTSP | Captura la cámara con OpenCV, envía frames crudos a FFmpeg vía stdin. FFmpeg codifica en H.264 y publica al servidor MediaMTX. |
+| **`receptor.py`** | Cliente RTSP | Se conecta a la URL RTSP, recibe paquetes RTP, decodifica H.264 y muestra el vídeo en una ventana OpenCV. |
+| **MediaMTX** | Servidor RTSP | Servidor ligero que redistribuye el flujo a múltiples clientes. Se descarga automáticamente al ejecutar el emisor. |
+| **FFmpeg** | Codificador | Convierte vídeo crudo BGR a H.264 y lo empaqueta en RTSP/RTP. Debe instalarse manualmente. |
+
+---
+
+## Requisitos previos
+
+### Software necesario
+
+| Requisito | Versión mínima | Cómo verificar | Instalación |
+|-----------|---------------|-----------------|-------------|
+| Python | 3.8+ | `python --version` | [python.org](https://www.python.org/downloads/) |
+| FFmpeg | 4.0+ | `ffmpeg -version` | Ver sección abajo |
+| pip | (incluido con Python) | `pip --version` | — |
+
+> **Nota:** MediaMTX se descarga **automáticamente** la primera vez que ejecutas `emisor.py`. No necesitas instalarlo manualmente.
+
+### Instalar FFmpeg en Windows
+
+FFmpeg es un programa externo que se debe descargar e instalar manualmente:
+
+1. Ve a [https://www.gyan.dev/ffmpeg/builds/](https://www.gyan.dev/ffmpeg/builds/)
+2. Descarga **ffmpeg-release-essentials.zip** (la versión "essentials" es suficiente)
+3. Extrae el ZIP en una ubicación permanente, por ejemplo: `C:\ffmpeg`
+4. Añade la carpeta `bin` al PATH del sistema:
+
+```powershell
+# Verificar que FFmpeg funcione:
+ffmpeg -version
+```
+
+**Para añadir FFmpeg al PATH permanentemente:**
+
+1. Busca "Variables de entorno" en el menú de inicio de Windows
+2. En "Variables del sistema", busca `Path` y haz clic en "Editar"
+3. Haz clic en "Nuevo" y añade la ruta: `C:\ffmpeg\bin` (ajusta según dónde lo extrajiste)
+4. Acepta y reinicia la terminal
+
+### Dependencias de Python
 
 ```powershell
 cd "C:\Users\Luis Fdo\Documents\GitHub\Demo RTSP"
@@ -16,21 +85,39 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
+Las dependencias de Python son:
+- **`opencv-python`**: captura de cámara, decodificación H.264, y visualización de vídeo
+- **`numpy`**: manipulación de arrays de píxeles (requerido por OpenCV)
+
 Para salir del entorno virtual:
 
 ```powershell
-Deactivate
+deactivate
 ```
+
+---
 
 ## ¿Qué es una dirección IP? (Explicación simple)
 
 Imagina que tienes dos casas y quieres enviar una carta de una a otra. Necesitas saber la dirección de la otra casa, ¿verdad?
 
-**Las computadoras es lo mismo:** cada computadora en una red tiene una "dirección" llamada **dirección IP**. Esta dirección permite que una computadora encuentre y se comunique con otra.
+**Las computadoras funcionan igual:** cada computadora en una red tiene una "dirección" llamada **dirección IP**. Esta dirección permite que una computadora encuentre y se comunique con otra.
 
 **Ejemplo de dirección IP:** `192.168.1.42`
 
-Una dirección IP es un número de 4 partes separadas por puntos. Cada parte es un número entre 0 y 255.
+Una dirección IP (versión 4 / IPv4) es un número de 4 partes separadas por puntos. Cada parte es un número entre 0 y 255.
+
+**¿Por qué usamos IPv4?**
+- IPv4 significa **Internet Protocol version 4**.
+- Es la versión más común de direcciones IP usadas en redes locales y la mayoría de las redes domésticas.
+- En este proyecto la usamos porque los equipos de la red local suelen comunicarse con direcciones IPv4 como `192.168.x.x`.
+
+**Qué significa cada parte de `192.168.1.42`:**
+- `192.168`: identifica la red local o subred.
+- `1`: identifica el segmento interno dentro de esa red.
+- `42`: identifica el equipo específico dentro de esa red.
+
+> Nota: cada bloque se llama "octeto" porque es un valor de 8 bits, y 4 octetos suman 32 bits en total.
 
 ### ¿Cómo encontrar la dirección IP del emisor?
 
@@ -54,44 +141,26 @@ Adaptador de Ethernet:
 **Nota importante:**
 - Si tu computadora está conectada por **WiFi**, busca bajo la sección "Adaptador inalámbrico".
 - Si está conectada por **cable Ethernet**, busca bajo esa sección.
-- El número que ves **cambia solo si reinicia la computadora o desconectas de la red**. Normalmente es el mismo cada vez.
+- El número que ves **cambia solo si reinicias la computadora o desconectas de la red**. Normalmente es el mismo cada vez.
 
 ### Verificar que ambas máquinas están en la misma red
 
 Para que el receptor pueda encontrar al emisor, **ambas máquinas deben estar en la misma red local (WiFi o cable)**. Usa este comando en el **receptor** para verificar que ve al emisor:
 
 ```powershell
-ping 192.168.0.9
+ping 192.168.1.42
 ```
 
-Reemplaza `192.168.0.9` con la IP real del emisor.
+Reemplaza `192.168.1.42` con la IP real del emisor.
 
-Si ves mensajes como `Reply from 192.168.0.9`, significa que la red funciona. ✓
+Si ves mensajes como `Reply from 192.168.1.42`, significa que la red funciona. ✓
 
 Si ves `Timed out` o `no se alcanzó el host`, significa que las máquinas no se ven. En ese caso:
 1. Verifica que ambas máquinas estén en la misma red WiFi o cable.
 2. Comprueba que estás usando la IP correcta del emisor.
 3. Desactiva el firewall de Windows temporalmente para probar.
 
-### Verificar el puerto TCP 9999
-
-A veces el ping funciona pero la conexión TCP no. Esto ocurre cuando el puerto está bloqueado o el emisor no está realmente escuchando.
-
-En el **receptor**, ejecuta:
-
-```powershell
-Test-NetConnection 192.168.0.9 -Port 9999
-```
-
-Si ves `TcpTestSucceeded : False`, entonces el puerto no está abierto desde el emisor hacia el receptor. Sigue estos pasos:
-1. Asegúrate de que el emisor está corriendo y dice `Escuchando en 0.0.0.0:9999 ...`.
-2. Si el emisor no está corriendo, inicia:
-   ```powershell
-   python emisor.py 0.0.0.0 9999
-   ```
-3. Si el emisor está corriendo pero el puerto sigue cerrado, permite Python en el firewall o desactiva el firewall temporalmente.
-
-Si el emisor está en la misma máquina que ejecuta la prueba, `SourceAddress` y `RemoteAddress` serán iguales. Para comprobar bien la conexión, haz la prueba desde la otra computadora.
+---
 
 ## Cómo ejecutar
 
@@ -103,191 +172,273 @@ En la máquina con la cámara, abre PowerShell y escribe:
 ipconfig
 ```
 
-Busca la línea **"Dirección IPv4"** y copia ese número. Por ejemplo: `192.168.0.9`
+Busca la línea **"Dirección IPv4"** y copia ese número. Por ejemplo: `192.168.1.42`
 
-### Paso 2: Ejecuta el emisor
-
-En la máquina con la cámara, en PowerShell, ejecuta:
+### Paso 2: Ejecuta el emisor (máquina con la cámara)
 
 ```powershell
-python emisor.py 0.0.0.0 9999
-```
-
-Deberías ver un mensaje como:
-```
-✓ Cámara abierta (índice 0)
-Escuchando en 0.0.0.0:9999 ...
-```
-
-**Si ves un error de cámara**, es normal si no tienes cámara conectada. Para hacer pruebas, usa:
-```powershell
-python emisor.py 0.0.0.0 9999 --test
-```
-
-### Paso 3: Ejecuta el receptor
-
-En la otra máquina, abre PowerShell, ve a la carpeta del proyecto e ejecuta:
-
-```powershell
-cd "C:\ruta\a\tu\proyecto"
-python -m venv .venv
+cd "C:\ruta\al\proyecto"
 .\.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
-python receptor.py 192.168.0.9 9999
+python emisor.py
 ```
 
-Reemplaza `192.168.0.9` con la IP que encontraste en el Paso 1.
+Deberías ver algo como:
 
-Deberías ver un mensaje:
 ```
-Intentando conectar a 192.168.0.9:9999 ...
-Conectado al emisor. Recibiendo video...
+═══════════════════════════════════════════════════════════
+  EMISOR RTSP — Transmisión de cámara local
+═══════════════════════════════════════════════════════════
+
+[1/4] Verificando FFmpeg ...
+  ✓ FFmpeg encontrado
+
+[2/4] Preparando servidor RTSP (MediaMTX) ...
+  ↓ Descargando MediaMTX v1.12.2 ...       ← (solo la primera vez)
+  ✓ MediaMTX instalado en: ...\mediamtx\mediamtx.exe
+  → Iniciando MediaMTX en el puerto 8554 ...
+  ✓ MediaMTX iniciado (PID: 12345)
+
+[3/4] Abriendo cámara (índice 0) ...
+  ✓ Cámara abierta: 640x480 @ 30 FPS
+
+[4/4] Iniciando transmisión RTSP ...
+  ✓ Transmisión RTSP activa
+
+═══════════════════════════════════════════════════════════
+  URL RTSP del flujo:
+  → rtsp://192.168.1.42:8554/camara
+
+  Los receptores deben conectarse a esta URL.
+  También puedes probar con VLC: Medio → Abrir ubicación de red
+═══════════════════════════════════════════════════════════
+
+  Presiona Ctrl+C para detener la transmisión.
 ```
 
-Y una ventana mostrará el vídeo en tiempo real.
+**Opciones del emisor:**
 
-### Detener los programas
+```powershell
+python emisor.py --puerto 8554     # Puerto RTSP (por defecto: 8554)
+python emisor.py --cam 1           # Usar segunda cámara
+python emisor.py --calidad 4000    # Mayor calidad de vídeo (kbps)
+python emisor.py --listar-camaras  # Ver cámaras disponibles
+```
 
-- **Receptor:** presiona `q` en la ventana del vídeo.
-- **Emisor:** presiona `Ctrl+C` en PowerShell.
+### Paso 3: Ejecuta el receptor (otra máquina)
+
+En la otra computadora, abre PowerShell:
+
+```powershell
+cd "C:\ruta\al\proyecto"
+.\.venv\Scripts\Activate.ps1
+python receptor.py 192.168.1.42
+```
+
+O con la URL RTSP completa:
+
+```powershell
+python receptor.py rtsp://192.168.1.42:8554/camara
+```
+
+Deberías ver:
+
+```
+═══════════════════════════════════════════════════════════
+  RECEPTOR RTSP — Visualización de flujo en tiempo real
+═══════════════════════════════════════════════════════════
+
+  URL RTSP: rtsp://192.168.1.42:8554/camara
+  Transporte: TCP entrelazado (interleaved)
+  Presiona 'q' en la ventana para salir.
+
+  [Intento 1] Conectando a rtsp://192.168.1.42:8554/camara ...
+  ✓ Conectado al flujo RTSP
+  Resolución: 640x480
+  FPS del flujo: 30.0
+
+  Recibiendo vídeo en tiempo real ...
+```
+
+Y una ventana mostrará el vídeo en tiempo real con un indicador de FPS y estado.
+
+**Opciones del receptor:**
+
+```powershell
+python receptor.py 192.168.1.42             # IP con puerto por defecto (8554)
+python receptor.py 192.168.1.42 9554        # IP con puerto personalizado
+python receptor.py rtsp://IP:PUERTO/camara  # URL RTSP completa
+python receptor.py --sin-hud IP             # Sin overlay de información
+```
+
+### Paso 4: Detener los programas
+
+- **Receptor:** presiona `q` en la ventana del vídeo, o `Ctrl+C` en la terminal.
+- **Emisor:** presiona `Ctrl+C` en PowerShell. Esto detiene FFmpeg, MediaMTX y libera la cámara automáticamente.
+
+### Verificar con VLC (opcional)
+
+Puedes probar el flujo RTSP con cualquier reproductor compatible. En VLC:
+
+1. Abre VLC
+2. Ve a **Medio → Abrir ubicación de red** (o `Ctrl+N`)
+3. Escribe: `rtsp://192.168.1.42:8554/camara`
+4. Haz clic en **Reproducir**
+
+---
 
 ## Resolución de problemas comunes
 
-### "Se produjo un error durante el intento de conexión"
+### "FFmpeg no está instalado o no está en el PATH"
 
-**Causa:** El receptor no puede alcanzar al emisor.
+**Causa:** FFmpeg no se encontró en las variables de entorno del sistema.
 
-**Soluciones:**
-1. Verifica que el emisor esté ejecutándose (deberías ver "Escuchando en 0.0.0.0:9999").
-2. Verifica que ambas máquinas estén en la **misma red WiFi o cable**.
-3. Verifica que usaste la **IP correcta** del emisor en el receptor.
-4. Prueba hacer ping:
-   ```powershell
-   ping 192.168.0.9
-   ```
-   Si ves "Timed out", hay un problema de red.
+**Solución:**
+1. Descarga FFmpeg desde [gyan.dev/ffmpeg/builds](https://www.gyan.dev/ffmpeg/builds/)
+2. Extrae en `C:\ffmpeg`
+3. Añade `C:\ffmpeg\bin` al PATH del sistema
+4. Reinicia la terminal y verifica con `ffmpeg -version`
 
 ### "No se pudo abrir la cámara"
 
-Soluciones:
-1. Asegúrate de que la cámara esté conectada y no en uso por otro programa.
-2. Intenta con otro índice:
+**Solución:**
+1. Asegúrate de que la cámara esté conectada y no en uso por otro programa (Zoom, Teams, etc.)
+2. Lista las cámaras disponibles:
    ```powershell
-   python emisor.py 0.0.0.0 9999 --cam 1
+   python emisor.py --listar-camaras
    ```
-3. Usa modo de prueba (genera frames de prueba sin necesidad de cámara):
+3. Intenta con otro índice:
    ```powershell
-   python emisor.py 0.0.0.0 9999 --test
+   python emisor.py --cam 1
    ```
+
+### "No se pudo conectar al flujo RTSP" (en el receptor)
+
+**Causa:** El receptor no puede alcanzar al servidor RTSP del emisor.
+
+**Soluciones:**
+1. Verifica que el emisor esté ejecutándose y muestre la URL RTSP.
+2. Verifica que ambas máquinas estén en la **misma red WiFi o cable**.
+3. Verifica que usaste la **IP correcta** del emisor.
+4. Prueba hacer ping desde el receptor:
+   ```powershell
+   ping 192.168.1.42
+   ```
+5. Verifica que el puerto 8554 no esté bloqueado por el firewall:
+   ```powershell
+   Test-NetConnection 192.168.1.42 -Port 8554
+   ```
+   Si `TcpTestSucceeded` es `False`, permite el acceso en el firewall de Windows.
+
+### "MediaMTX terminó inesperadamente"
+
+**Causa:** El puerto 8554 ya está en uso, o el firewall bloqueó el proceso.
+
+**Soluciones:**
+1. Verifica que no haya otra instancia de MediaMTX corriendo:
+   ```powershell
+   Get-Process mediamtx -ErrorAction SilentlyContinue | Stop-Process
+   ```
+2. Usa un puerto diferente:
+   ```powershell
+   python emisor.py --puerto 9554
+   # Y en el receptor:
+   python receptor.py 192.168.1.42 9554
+   ```
+3. Si el firewall de Windows muestra un diálogo pidiendo permiso, haz clic en **Permitir acceso**.
 
 ### El vídeo es muy lento o entrecortado
 
-Opciones para mejorar:
-- Reduce la calidad JPEG (menos bytes = más rápido).
-- Usa una red más rápida (WiFi 5GHz en lugar de 2.4GHz).
-- Acerca las máquinas (menos interferencias).
-- Reduce la resolución de la cámara.
+**Opciones para mejorar:**
+- Reduce el bitrate (menos datos = más rápido):
+  ```powershell
+  python emisor.py --calidad 1000
+  ```
+- Usa una red más rápida (WiFi 5 GHz en lugar de 2.4 GHz).
+- Conecta ambas máquinas por cable Ethernet.
+- Acerca las máquinas al router (menos interferencias WiFi).
 
-Nota: los scripts incluidos en este repositorio aceptan argumentos posicionales simples.
+---
 
-- Ejecutar el emisor (máquina con la cámara):
+## Explicación técnica detallada
 
-```powershell
-python emisor.py [HOST] [PUERTO]
-# Ejemplo: python emisor.py 0.0.0.0 9999
+### Flujo del protocolo RTSP
+
+```
+  EMISOR (FFmpeg)                    SERVIDOR (MediaMTX)                  RECEPTOR (OpenCV)
+       │                                    │                                    │
+       │── ANNOUNCE (SDP del flujo) ──────►│                                    │
+       │◄── 200 OK ──────────────────────── │                                    │
+       │── SETUP (negociar RTP/TCP) ──────►│                                    │
+       │◄── 200 OK (puertos asignados) ──── │                                    │
+       │── RECORD ────────────────────────►│                                    │
+       │◄── 200 OK ──────────────────────── │                                    │
+       │                                    │                                    │
+       │ ═══ Envío continuo de RTP ═══════►│                                    │
+       │    (paquetes H.264)               │◄── DESCRIBE ─────────────────────── │
+       │                                    │── 200 OK (SDP) ──────────────────►│
+       │                                    │◄── SETUP ────────────────────────── │
+       │                                    │── 200 OK ────────────────────────►│
+       │                                    │◄── PLAY ─────────────────────────── │
+       │                                    │── 200 OK ────────────────────────►│
+       │                                    │                                    │
+       │ ═══ RTP ═════════════════════════►│ ═══ RTP ═══════════════════════════►│
+       │                                    │    (paquetes H.264)               │
+       │                                    │                                    │
+       │── TEARDOWN ──────────────────────►│◄── TEARDOWN ─────────────────────── │
+       │                                    │                                    │
 ```
 
-- Ejecutar el receptor (máquina que verá el vídeo):
+### `emisor.py` — Detalle técnico
 
-```powershell
-python receptor.py [IP_DEL_EMISOR] [PUERTO]
-# Ejemplo: python receptor.py 192.168.0.9 9999
+1. **Verificación de FFmpeg:** El script comprueba que `ffmpeg` esté accesible ejecutando `ffmpeg -version`.
+
+2. **MediaMTX (Servidor RTSP):** Se descarga automáticamente desde GitHub Releases la primera vez. MediaMTX es un servidor RTSP/RTMP/HLS/WebRTC de un solo binario sin dependencias. Se inicia como proceso hijo y escucha en el puerto 8554 por defecto. La variable de entorno `MTX_RTSPADDRESS` permite cambiar el puerto.
+
+3. **Captura con OpenCV:** `cv2.VideoCapture(0, cv2.CAP_DSHOW)` abre la cámara usando DirectShow en Windows. Se leen las propiedades de resolución y FPS para configurar FFmpeg correctamente.
+
+4. **Codificación y publicación con FFmpeg:**
+   - Se lanza FFmpeg como subproceso con `stdin=subprocess.PIPE`
+   - Formato de entrada: vídeo crudo BGR24 (el formato nativo de OpenCV)
+   - Codificador: `libx264` con `preset=ultrafast` y `tune=zerolatency` para mínima latencia
+   - Formato de salida: RTSP sobre TCP
+   - FFmpeg envía ANNOUNCE + SETUP + RECORD al servidor MediaMTX
+   - Cada fotograma capturado se escribe como bytes crudos en el stdin de FFmpeg
+
+5. **Manejo de errores:** `try/finally` asegura que todos los procesos (FFmpeg, MediaMTX) se detengan y la cámara se libere al salir.
+
+### `receptor.py` — Detalle técnico
+
+1. **Configuración del transporte:** Se usa la variable `OPENCV_FFMPEG_CAPTURE_OPTIONS=rtsp_transport;tcp` para forzar TCP entrelazado (interleaved) en vez de UDP. Esto es más fiable en redes con firewalls.
+
+2. **Conexión RTSP:** `cv2.VideoCapture(url_rtsp, cv2.CAP_FFMPEG)` abre la URL RTSP. Internamente, FFmpeg realiza la secuencia DESCRIBE → SETUP → PLAY automáticamente.
+
+3. **Decodificación:** FFmpeg decodifica los paquetes RTP (H.264 NAL units) a fotogramas BGR24 que OpenCV puede mostrar directamente.
+
+4. **HUD (Head-Up Display):** Se dibuja un overlay semitransparente con FPS en tiempo real, contador de fotogramas y tiempo transcurrido.
+
+5. **Reconexión automática:** Si el flujo se interrumpe, el receptor espera unos segundos y reintenta la conexión indefinidamente.
+
+---
+
+## Estructura del proyecto
+
+```
+Demo RTSP/
+├── emisor.py           # Script del emisor (captura + FFmpeg + MediaMTX)
+├── receptor.py         # Script del receptor (cliente RTSP + visualización)
+├── requirements.txt    # Dependencias de Python (opencv-python, numpy)
+├── README.md           # Esta documentación
+├── mediamtx/           # (generado automáticamente al ejecutar emisor.py)
+│   ├── mediamtx.exe    #   Servidor RTSP (descargado de GitHub)
+│   └── mediamtx.yml    #   Configuración del servidor
+└── .venv/              # Entorno virtual de Python
 ```
 
-- Para salir del receptor: presionar `q` en la ventana del stream.
-- Para detener el emisor: usar `Ctrl+C` en la terminal donde se ejecuta.
-
-## Explicación general (visión rápida)
-
-El sistema sigue un patrón emisor-receptor simple sobre TCP:
-
-- El `emisor` captura marcos de la cámara con OpenCV, los codifica como JPEG y envía cada marco como un bloque de bytes precedido por su tamaño (4 bytes, entero sin signo en big-endian).
-- El `receptor` se conecta por TCP, lee primero los 4 bytes que indican el tamaño del siguiente marco, luego recibe exactamente esa cantidad de bytes, decodifica el JPEG a una imagen OpenCV y la muestra en una ventana en tiempo real.
-
-Ambos scripts incluyen manejo básico de excepciones para reconexión y para liberar recursos correctamente.
-
-## Explicación detallada de `emisor.py`
-
-1) Imports y configuración
-
-- `socket`, `struct`: manejo de sockets TCP y empaquetado/desempaquetado de enteros (tamaño de frame).
-- `cv2` (OpenCV): captura y codificación de imágenes.
-- `time`, `sys`: utilidades (pausas y lectura de argumentos).
-
-2) Configuración de red
-
-- `HOST` y `PUERTO`: valores por defecto. `HOST='0.0.0.0'` permite aceptar conexiones desde cualquier interfaz.
-
-3) Apertura de la cámara
-
-- `cv2.VideoCapture(0)` abre la cámara por defecto. Si hay varias cámaras, cambiar el índice `0` por `1`, etc.
-
-4) Bucle de aceptación de receptores
-
-- El emisor crea un socket TCP y llama a `listen(1)` para aceptar una conexión entrante a la vez.
-- `accept()` devuelve una tupla `(conexion, direccion)` donde `conexion` es un socket nuevo para comunicarse con ese receptor.
-
-5) Captura, codificación y envío de fotogramas
-
-- Cada iteración del bucle principal captura un fotograma con `camara.read()`.
-- Se codifica con `cv2.imencode('.jpg', fotograma, [cv2.IMWRITE_JPEG_QUALITY, 80])` para obtener bytes JPEG comprimidos. Ajustar la calidad reduce o aumenta el tamaño.
-- Antes de enviar los bytes, se envían 4 bytes con `struct.pack('!I', len(datos))` que indican el tamaño del bloque. `!I` significa entero sin signo (4 bytes) en orden de bytes big-endian.
-- Se llama a `conexion.sendall(tamaño + datos)` para enviar primero el tamaño y luego los datos del fotograma. `sendall` garantiza que se intente enviar todo el buffer.
-
-6) Manejo de desconexiones y excepciones
-
-- Si el receptor se desconecta inesperadamente (`BrokenPipeError`, `ConnectionResetError`) el emisor detecta la excepción y vuelve a esperar otra conexión.
-- `try/finally` asegura que la conexión se cierre y que la cámara y el socket del emisor se liberen al detenerse.
-
-## Explicación detallada de `receptor.py`
-
-1) Imports y configuración
-
-- `socket`, `struct`: manejo de conexión y lectura del tamaño del frame.
-- `cv2`, `numpy`: decodificación de los bytes JPEG y visualización.
-- `time`, `sys`: utilidades para reintentos y argumentos.
-
-2) Función `recibir_todo(socket_conexion, cantidad)`
-
-- `recv` puede devolver menos bytes de los solicitados. `recibir_todo` llama repetidamente hasta leer exactamente `cantidad` bytes o detectar que la conexión se cerró.
-
-3) Conexión al emisor
-
-- El receptor intenta conectar con `socket_receptor.connect((ip_emisor, puerto_emisor))`. Si no hay emisor, atrapa `ConnectionRefusedError` y vuelve a intentar después de un retardo.
-
-4) Recepción y reconstrucción de fotogramas
-
-- Lee primero 4 bytes: `datos_tamaño = recibir_todo(socket_conexion, 4)` y desempaqueta con `struct.unpack('!I', datos_tamaño)[0]` para obtener el tamaño del fotograma.
-- Luego llama a `recibir_todo(socket_conexion, tamaño_fotograma)` para recibir exactamente los bytes JPEG.
-- Convierte los bytes a un arreglo NumPy (`np.frombuffer`) y decodifica con `cv2.imdecode` para obtener la imagen en BGR lista para mostrar.
-
-5) Visualización y control
-
-- Los fotogramas se muestran con `cv2.imshow` y `cv2.waitKey(1)` para refrescar la ventana.
-- Presionar `q` cierra el receptor limpiamente.
-
-6) Reintentos y manejo de errores
-
-- Si la conexión se pierde o los datos vienen incompletos, el receptor cierra el socket y entra en un bucle que intenta reconectar cada `RETARDO_RECONEXION` segundos.
-
-## Consejos prácticos y consideraciones de red
-
-- Asegúrate de que el firewall permita conexiones entrantes en el puerto elegido en la máquina emisor.
-- Usa la IP LAN (por ejemplo `192.168.0.9`) del emisor cuando ejecutes el receptor desde otra máquina en la misma red.
-- Si necesitas mejor rendimiento o menor latencia, reduce la calidad JPEG (por ejemplo 60) o emplea compresión/streaming optimizado.
-- Para entornos reales y producción considera protocolos diseñados para vídeo (RTSP, WebRTC) y cifrado.
+---
 
 ## Notas finales
 
-Estos scripts son un ejemplo didáctico y funcional para redes locales. Sirven como base para experimentar y extender con features como múltiples receptores, autenticación, cifrado TLS, o transmisión con menor latencia.
-
+- Este proyecto usa **RTSP real** (RFC 2326) con transporte RTP para el vídeo, no sockets TCP crudos.
+- MediaMTX permite múltiples receptores simultáneos conectados al mismo flujo.
+- También puedes verificar el flujo con VLC, ffplay, o cualquier reproductor RTSP.
+- Para producción, considera añadir autenticación RTSP (MediaMTX lo soporta vía `mediamtx.yml`) y cifrado TLS/SRTP.

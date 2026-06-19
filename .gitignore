@@ -1,0 +1,14 @@
+# Entorno virtual de Python
+.venv/
+
+# MediaMTX (servidor RTSP, descargado automáticamente por emisor.py)
+mediamtx/
+
+# Cache de Python
+__pycache__/
+*.pyc
+*.pyo
+
+# IDE
+.vscode/
+.idea/

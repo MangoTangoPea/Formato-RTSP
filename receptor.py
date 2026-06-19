@@ -1,106 +1,432 @@
 #!/usr/bin/env python3
-"""Receptor: se conecta al emisor y recibe vídeo por TCP.
+"""
+Receptor RTSP: se conecta a un servidor RTSP y muestra el flujo de vídeo
+en tiempo real usando OpenCV.
+
+Arquitectura de recepción RTSP:
+───────────────────────────────
+  ┌──────────┐                ┌──────────┐   RTSP/RTP    ┌──────────┐
+  │  Cámara  │ ─── FFmpeg ──► │ MediaMTX │ ────────────► │ Receptor │
+  │ (emisor) │                │ (server) │               │ (este    │
+  └──────────┘                └──────────┘               │  script) │
+                                                         └──────────┘
+
+Secuencia de señalización RTSP que realiza el receptor:
+  1. DESCRIBE  → Solicita la descripción SDP (Session Description Protocol)
+                  del flujo disponible en la URL RTSP.
+  2. SETUP     → Negocia los parámetros de transporte RTP:
+                  puertos UDP o TCP entrelazado para recibir paquetes.
+  3. PLAY      → Inicia la recepción de paquetes RTP con vídeo H.264.
+  4. TEARDOWN  → Finaliza la sesión cuando el receptor se desconecta.
+
+OpenCV maneja toda esta secuencia internamente al abrir una URL rtsp://
+con cv2.VideoCapture().
 
 Uso:
-    python receptor.py [IP_DEL_EMISOR] [PUERTO]
+    python receptor.py [URL_RTSP]
+    python receptor.py [IP_EMISOR] [PUERTO]
 
-Ejemplo:
-    python receptor.py 192.168.0.9 9999
+Ejemplos:
+    python receptor.py rtsp://192.168.1.42:8554/camara
+    python receptor.py 192.168.1.42 8554
 """
-import socket
-import struct
-import cv2
-import numpy as np
-import time
+
 import sys
+import time
+import argparse
+import os
 
-# Dirección del emisor a la que conectarse
-IP_EMISOR = '127.0.0.1'
-PUERTO_EMISOR = 9999
-RETARDO_RECONEXION = 2  # segundos a esperar antes de reintentar
+# ─── Intentar importar OpenCV ─────────────────────────────────────────────
+try:
+    import cv2
+except ImportError:
+    print("Error: opencv-python no está instalado.")
+    print("  Instálalo con:  pip install opencv-python")
+    sys.exit(1)
 
-def recibir_todo(socket_conexion, cantidad):
-    """Recibir exactamente 'cantidad' bytes desde el socket"""
-    buffer = b''
-    while len(buffer) < cantidad:
-        parte = socket_conexion.recv(cantidad - len(buffer))
-        if not parte:
-            # Si recv devuelve vacío, la conexión se cerró
-            return None
-        buffer += parte
-    return buffer
+# ─── Intentar importar numpy ──────────────────────────────────────────────
+try:
+    import numpy as np
+except ImportError:
+    print("Error: numpy no está instalado.")
+    print("  Instálalo con:  pip install numpy")
+    sys.exit(1)
 
-def iniciar_receptor(ip_emisor=IP_EMISOR, puerto_emisor=PUERTO_EMISOR):
-    """Conectar al emisor y recibir frames de video"""
+
+# ═══════════════════════════════════════════════════════════════════════════
+# CONSTANTES Y CONFIGURACIÓN POR DEFECTO
+# ═══════════════════════════════════════════════════════════════════════════
+
+# Puerto RTSP estándar (RFC 2326)
+PUERTO_RTSP_DEFECTO = 8554
+
+# Ruta del flujo en el servidor (debe coincidir con la del emisor)
+RUTA_FLUJO = "camara"
+
+# Tiempo de espera antes de reintentar la conexión (en segundos)
+RETARDO_RECONEXION = 3
+
+# Número máximo de intentos de reconexión (-1 = infinito)
+MAX_REINTENTOS = -1
+
+# Nombre de la ventana de visualización
+NOMBRE_VENTANA = "Receptor RTSP - Video en Directo"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# FUNCIONES AUXILIARES
+# ═══════════════════════════════════════════════════════════════════════════
+
+def construir_url_rtsp(ip, puerto, ruta=RUTA_FLUJO):
+    """
+    Construye la URL RTSP completa a partir de los componentes.
+
+    Formato de URL RTSP según RFC 2326:
+      rtsp://<host>:<puerto>/<ruta>
+
+    Donde:
+      - host:   dirección IP o nombre de host del servidor RTSP
+      - puerto: puerto TCP del servidor (por defecto 554 en RTSP,
+                pero usamos 8554 para MediaMTX)
+      - ruta:   identificador del recurso/flujo en el servidor
+
+    Args:
+        ip: Dirección IP del servidor RTSP
+        puerto: Puerto TCP del servidor
+        ruta: Ruta del recurso en el servidor
+
+    Retorna la URL RTSP completa como cadena.
+    """
+    return f"rtsp://{ip}:{puerto}/{ruta}"
+
+
+def configurar_captura_rtsp(url_rtsp):
+    """
+    Configura un objeto cv2.VideoCapture optimizado para RTSP.
+
+    OpenCV usa internamente FFmpeg para la decodificación RTSP.
+    Al abrir una URL rtsp://, FFmpeg realiza automáticamente la
+    secuencia de señalización RTSP:
+      1. Conecta al servidor por TCP en el puerto indicado
+      2. Envía DESCRIBE para obtener la descripción SDP del flujo
+      3. Envía SETUP para configurar el canal RTP
+      4. Envía PLAY para comenzar a recibir paquetes RTP
+
+    Las variables de entorno OPENCV_FFMPEG_* permiten personalizar
+    el comportamiento del backend FFmpeg dentro de OpenCV:
+      - OPENCV_FFMPEG_CAPTURE_OPTIONS: opciones adicionales para FFmpeg
+        → "rtsp_transport;tcp" fuerza TCP en vez de UDP para el transporte
+          RTP, lo cual es más fiable en redes con firewalls o NAT.
+
+    Args:
+        url_rtsp: URL RTSP completa del flujo a recibir.
+
+    Retorna un objeto cv2.VideoCapture configurado, o None si falla.
+    """
+    # Configurar FFmpeg dentro de OpenCV para usar TCP como transporte RTSP
+    # Esto evita problemas con firewalls que bloquean puertos UDP aleatorios
+    # usados por RTP en modo UDP. TCP entrelazado (interleaved) encapsula
+    # los paquetes RTP dentro de la misma conexión TCP de señalización.
+    os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp"
+
+    # Crear el objeto de captura con el backend FFmpeg
+    # cv2.CAP_FFMPEG asegura que se use FFmpeg para manejar RTSP
+    captura = cv2.VideoCapture(url_rtsp, cv2.CAP_FFMPEG)
+
+    if not captura.isOpened():
+        return None
+
+    # Configurar el buffer de captura al mínimo para reducir latencia
+    # Un buffer grande introduce retardo porque OpenCV almacena fotogramas
+    # antes de entregarlos al programa
+    captura.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+    return captura
+
+
+def mostrar_info_flujo(captura):
+    """
+    Muestra información técnica del flujo RTSP recibido.
+    Lee las propiedades del vídeo desde el objeto VideoCapture
+    que internamente las obtiene de la descripción SDP del flujo.
+
+    Args:
+        captura: Objeto cv2.VideoCapture conectado al flujo RTSP.
+    """
+    ancho = int(captura.get(cv2.CAP_PROP_FRAME_WIDTH))
+    alto = int(captura.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    fps = captura.get(cv2.CAP_PROP_FPS)
+
+    print(f"  Resolución: {ancho}x{alto}")
+    print(f"  FPS del flujo: {fps:.1f}")
+    print(f"  Backend: {int(captura.get(cv2.CAP_PROP_BACKEND))}")
+
+
+def dibujar_hud(fotograma, fps_actual, fotogramas_recibidos, tiempo_transcurrido):
+    """
+    Dibuja información de estado (HUD) sobre el fotograma.
+    Muestra FPS en tiempo real, contador de fotogramas y tiempo.
+
+    Args:
+        fotograma: Imagen OpenCV (numpy array BGR) donde dibujar.
+        fps_actual: FPS calculado en tiempo real.
+        fotogramas_recibidos: Contador total de fotogramas recibidos.
+        tiempo_transcurrido: Segundos desde el inicio de la recepción.
+
+    Retorna el fotograma con el HUD dibujado.
+    """
+    alto, ancho = fotograma.shape[:2]
+
+    # Fondo semitransparente para el texto (esquina superior izquierda)
+    overlay = fotograma.copy()
+    cv2.rectangle(overlay, (5, 5), (280, 75), (0, 0, 0), -1)
+    cv2.addWeighted(overlay, 0.5, fotograma, 0.5, 0, fotograma)
+
+    # Texto con información de estado
+    fuente = cv2.FONT_HERSHEY_SIMPLEX
+    color_texto = (0, 255, 0)  # Verde
+
+    cv2.putText(fotograma, f"RTSP EN VIVO", (10, 25),
+                fuente, 0.5, (0, 0, 255), 1, cv2.LINE_AA)
+    cv2.putText(fotograma, f"FPS: {fps_actual:.1f} | Frames: {fotogramas_recibidos}",
+                (10, 50), fuente, 0.45, color_texto, 1, cv2.LINE_AA)
+    cv2.putText(fotograma, f"Tiempo: {tiempo_transcurrido:.0f}s",
+                (10, 70), fuente, 0.45, color_texto, 1, cv2.LINE_AA)
+
+    return fotograma
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# FUNCIÓN PRINCIPAL DEL RECEPTOR
+# ═══════════════════════════════════════════════════════════════════════════
+
+def iniciar_receptor(url_rtsp, mostrar_hud_info=True):
+    """
+    Función principal del receptor RTSP.
+
+    Se conecta a la URL RTSP indicada, recibe los paquetes RTP con
+    vídeo H.264, los decodifica y muestra en una ventana de OpenCV.
+
+    Incluye lógica de reconexión automática: si el flujo se interrumpe
+    (el emisor se detiene, la red falla, etc.), el receptor espera
+    unos segundos y vuelve a intentar conectarse.
+
+    Protocolo de red involucrado:
+    ───────────────────────────
+    - RTSP (TCP, puerto 8554): señalización de la sesión
+      → OpenCV/FFmpeg envía DESCRIBE para obtener el SDP
+      → Envía SETUP para negociar los parámetros RTP
+      → Envía PLAY para iniciar la recepción de vídeo
+    - RTP (TCP entrelazado): transporte de paquetes de vídeo H.264
+      → Los paquetes llegan encapsulados dentro de la conexión TCP
+      → FFmpeg los decodifica de H.264 a BGR24 para OpenCV
+    - RTCP: informes de control de calidad del flujo
+      → Se intercambian automáticamente por FFmpeg/OpenCV
+
+    Args:
+        url_rtsp: URL RTSP completa (e.g., rtsp://192.168.1.42:8554/camara)
+        mostrar_hud_info: Si True, dibuja información de estado en el vídeo.
+    """
+    intento = 0
+
+    print("\n" + "═" * 60)
+    print("  RECEPTOR RTSP — Visualización de flujo en tiempo real")
+    print("═" * 60)
+    print(f"\n  URL RTSP: {url_rtsp}")
+    print(f"  Transporte: TCP entrelazado (interleaved)")
+    print(f"  Presiona 'q' en la ventana para salir.\n")
+
     while True:
-        socket_receptor = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        try:
-            print(f"Intentando conectar a {ip_emisor}:{puerto_emisor} ...")
-            socket_receptor.connect((ip_emisor, puerto_emisor))
-            print("Conectado al emisor. Recibiendo video...")
-            
-            while True:
-                # Primero recibir 4 bytes con el tamaño del siguiente fotograma
-                datos_tamaño = recibir_todo(socket_receptor, 4)
-                if not datos_tamaño:
-                    # Conexión cerrada por el emisor
-                    print("Conexión perdida (no se recibió el tamaño).")
-                    break
-                
-                # Desempaquetar tamaño (big-endian unsigned int)
-                tamaño_fotograma = struct.unpack('!I', datos_tamaño)[0]
-                
-                # Recibir el bloque de bytes del fotograma según el tamaño
-                datos_fotograma = recibir_todo(socket_receptor, tamaño_fotograma)
-                if not datos_fotograma:
-                    print("Conexión perdida (datos incompletos).")
-                    break
+        intento += 1
+        captura = None
 
-                # Convertir bytes recibidos a imagen OpenCV
-                datos_numpy = np.frombuffer(datos_fotograma, dtype=np.uint8)
-                fotograma = cv2.imdecode(datos_numpy, cv2.IMREAD_COLOR)
-                if fotograma is None:
-                    # Si la decodificación falla, saltar este fotograma
+        # Verificar si se excedió el máximo de reintentos
+        if MAX_REINTENTOS > 0 and intento > MAX_REINTENTOS:
+            print(f"\n  ✗ Se alcanzó el máximo de {MAX_REINTENTOS} intentos.")
+            break
+
+        try:
+            # ─── Intentar conectar al flujo RTSP ──────────────────────
+            if intento == 1:
+                print(f"  [Intento {intento}] Conectando a {url_rtsp} ...")
+            else:
+                print(f"  [Intento {intento}] Reconectando a {url_rtsp} ...")
+
+            captura = configurar_captura_rtsp(url_rtsp)
+
+            if captura is None or not captura.isOpened():
+                # La conexión RTSP falló — el servidor no responde o la URL
+                # no existe. Esto puede significar:
+                #   - El emisor no está corriendo
+                #   - La IP/puerto son incorrectos
+                #   - El firewall bloquea la conexión TCP
+                #   - La ruta del flujo no coincide
+                print(f"  ✗ No se pudo conectar al flujo RTSP.")
+                print(f"    Verificar que el emisor esté activo y la URL sea correcta.")
+                print(f"    Reintentando en {RETARDO_RECONEXION} segundos ...")
+                time.sleep(RETARDO_RECONEXION)
+                continue
+
+            # ─── Conexión exitosa ──────────────────────────────────────
+            print(f"  ✓ Conectado al flujo RTSP")
+            mostrar_info_flujo(captura)
+            print(f"\n  Recibiendo vídeo en tiempo real ...\n")
+
+            # Contadores para estadísticas
+            fotogramas_recibidos = 0
+            tiempo_inicio = time.time()
+            fotogramas_fallidos = 0
+
+            # ─── Bucle de recepción de fotogramas ──────────────────────
+            # cv2.VideoCapture.read() internamente:
+            #   1. Lee paquetes RTP del buffer de red
+            #   2. Ensambla los fragmentos NAL del H.264
+            #   3. Decodifica el fotograma H.264 a BGR24
+            #   4. Retorna el fotograma como numpy array
+            while True:
+                ret, fotograma = captura.read()
+
+                if not ret or fotograma is None:
+                    # La lectura falló — posibles causas:
+                    #   - El emisor dejó de enviar fotogramas
+                    #   - Pérdida de paquetes RTP (corrupción)
+                    #   - La conexión TCP se cerró
+                    fotogramas_fallidos += 1
+
+                    if fotogramas_fallidos > 30:
+                        # Demasiados fotogramas fallidos consecutivos:
+                        # el flujo probablemente se interrumpió
+                        print("  ⚠ Flujo interrumpido (demasiados errores de lectura).")
+                        break
                     continue
 
-                # Mostrar el fotograma en una ventana
-                cv2.imshow('Video en directo (presione q para salir)', fotograma)
-                # Salir si el usuario presiona 'q'
-                if cv2.waitKey(1) & 0xFF == ord('q'):
-                    print("Usuario solicitó salir.")
-                    socket_receptor.close()
+                # Resetear el contador de fallos al recibir un fotograma válido
+                fotogramas_fallidos = 0
+                fotogramas_recibidos += 1
+
+                # Calcular FPS en tiempo real
+                tiempo_transcurrido = time.time() - tiempo_inicio
+                if tiempo_transcurrido > 0:
+                    fps_actual = fotogramas_recibidos / tiempo_transcurrido
+                else:
+                    fps_actual = 0.0
+
+                # Dibujar información de estado (HUD) si está habilitado
+                if mostrar_hud_info:
+                    fotograma = dibujar_hud(
+                        fotograma, fps_actual,
+                        fotogramas_recibidos, tiempo_transcurrido
+                    )
+
+                # ─── Mostrar el fotograma en la ventana ────────────────
+                cv2.imshow(NOMBRE_VENTANA, fotograma)
+
+                # Verificar si el usuario presionó 'q' para salir
+                # cv2.waitKey(1) espera 1ms y devuelve el código de tecla
+                # El AND con 0xFF extrae los 8 bits menos significativos
+                # (necesario para compatibilidad en algunos sistemas)
+                tecla = cv2.waitKey(1) & 0xFF
+                if tecla == ord('q') or tecla == ord('Q'):
+                    print(f"\n  ⏹ Receptor detenido por el usuario (tecla 'q').")
+                    print(f"    Fotogramas recibidos: {fotogramas_recibidos}")
+                    print(f"    Tiempo total: {tiempo_transcurrido:.1f}s")
+                    print(f"    FPS promedio: {fps_actual:.1f}")
+                    # Liberar recursos y salir completamente
+                    captura.release()
                     cv2.destroyAllWindows()
                     return
-        
-        except ConnectionRefusedError:
-            # No hay emisor escuchando en esa IP/puerto
-            print(f"No se pudo conectar a {ip_emisor}:{puerto_emisor}. Reintentando en {RETARDO_RECONEXION}s...")
-            time.sleep(RETARDO_RECONEXION)
-        
+
+                # Si se cierra la ventana con la X, también salir
+                if cv2.getWindowProperty(NOMBRE_VENTANA, cv2.WND_PROP_VISIBLE) < 1:
+                    print(f"\n  ⏹ Ventana cerrada por el usuario.")
+                    captura.release()
+                    cv2.destroyAllWindows()
+                    return
+
         except KeyboardInterrupt:
-            # Permitir salir con Ctrl+C
-            print("\nReceptor detenido por el usuario.")
-            try:
-                socket_receptor.close()
-            except Exception:
-                pass
-            cv2.destroyAllWindows()
-            return
-        
-        except Exception as e:
-            # Capturar otras excepciones y reintentar
-            print(f"Error de conexión/recepción: {e}. Reintentando en {RETARDO_RECONEXION}s...")
-            try:
-                socket_receptor.close()
-            except Exception:
-                pass
+            # El usuario presionó Ctrl+C en la terminal
+            print(f"\n\n  ⏹ Receptor detenido por el usuario (Ctrl+C).")
+            break
+
+        except cv2.error as e:
+            # Error específico de OpenCV (decodificación, ventana, etc.)
+            print(f"  ✗ Error de OpenCV: {e}")
+            print(f"    Reintentando en {RETARDO_RECONEXION} segundos ...")
             time.sleep(RETARDO_RECONEXION)
 
+        except Exception as e:
+            # Cualquier otra excepción no prevista
+            print(f"  ✗ Error inesperado: {e}")
+            print(f"    Reintentando en {RETARDO_RECONEXION} segundos ...")
+            time.sleep(RETARDO_RECONEXION)
 
-if __name__ == '__main__':
-    # Permitir pasar IP y puerto por línea de comandos
-    if len(sys.argv) >= 2:
-        IP_EMISOR = sys.argv[1]
-    if len(sys.argv) >= 3:
-        PUERTO_EMISOR = int(sys.argv[2])
-    iniciar_receptor(IP_EMISOR, PUERTO_EMISOR)
+        finally:
+            # ─── Limpieza por iteración ────────────────────────────────
+            # Liberar la captura actual antes de reintentar
+            if captura is not None and captura.isOpened():
+                captura.release()
+
+    # ─── Limpieza final ────────────────────────────────────────────────
+    cv2.destroyAllWindows()
+    print("\n  Receptor finalizado.\n")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PUNTO DE ENTRADA
+# ═══════════════════════════════════════════════════════════════════════════
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="Receptor RTSP: recibe y muestra un flujo de vídeo RTSP en tiempo real.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Ejemplos de uso:
+  python receptor.py rtsp://192.168.1.42:8554/camara      # URL completa
+  python receptor.py 192.168.1.42                          # IP con puerto/ruta por defecto
+  python receptor.py 192.168.1.42 8554                     # IP y puerto
+  python receptor.py --sin-hud rtsp://192.168.1.42:8554/camara  # Sin overlay de info
+
+Notas:
+  - Asegúrate de que el emisor esté corriendo antes de iniciar el receptor.
+  - Ambas máquinas deben estar en la misma red local.
+  - Presiona 'q' en la ventana del vídeo para cerrar el receptor.
+        """
+    )
+
+    parser.add_argument(
+        "destino",
+        nargs="?",
+        default=None,
+        help="URL RTSP completa (rtsp://IP:puerto/ruta) o dirección IP del emisor"
+    )
+    parser.add_argument(
+        "puerto",
+        nargs="?",
+        type=int,
+        default=PUERTO_RTSP_DEFECTO,
+        help=f"Puerto del servidor RTSP (por defecto: {PUERTO_RTSP_DEFECTO})"
+    )
+    parser.add_argument(
+        "--sin-hud",
+        action="store_true",
+        help="No mostrar información de estado (HUD) sobre el vídeo"
+    )
+
+    args = parser.parse_args()
+
+    # Determinar la URL RTSP a partir de los argumentos
+    if args.destino is None:
+        # Sin argumentos: usar localhost por defecto
+        url = construir_url_rtsp("127.0.0.1", PUERTO_RTSP_DEFECTO)
+        print(f"  Sin argumentos. Usando URL por defecto: {url}")
+        print(f"  Uso: python receptor.py <IP_EMISOR> [PUERTO]")
+        print(f"       python receptor.py rtsp://IP:PUERTO/camara\n")
+    elif args.destino.startswith("rtsp://"):
+        # Se proporcionó una URL RTSP completa
+        url = args.destino
+    else:
+        # Se proporcionó solo la IP (y opcionalmente el puerto)
+        url = construir_url_rtsp(args.destino, args.puerto)
+
+    # Iniciar el receptor
+    iniciar_receptor(url, mostrar_hud_info=not args.sin_hud)
