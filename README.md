@@ -61,10 +61,12 @@ En este proyecto, **no necesitas instalar FFmpeg manualmente en Windows ni confi
 
 El sistema utiliza la dependencia de Python `imageio-ffmpeg`, la cual descarga e instala automáticamente un binario ejecutable estático de FFmpeg dentro del entorno virtual (`.venv`). Esto asegura un funcionamiento listo para usar ("out of the box") sin intervenciones manuales del usuario.
 
-### Dependencias de Python
+### Crear entorno virtual e instalar dependencias
+
+Es altamente recomendable usar un entorno virtual de Python. Abre PowerShell y ejecuta:
 
 ```powershell
-cd "C:\Users\Luis Fdo\Documents\GitHub\Demo RTSP"
+cd "C:\ruta\al\proyecto"
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
