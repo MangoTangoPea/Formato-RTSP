@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """
 Receptor RTSP: se conecta a un servidor RTSP y muestra el flujo de vídeo
-en tiempo real usando OpenCV.
+combinado (RGB + Profundidad) en tiempo real usando OpenCV.
 
 Arquitectura de recepción RTSP:
 ───────────────────────────────
-  ┌──────────┐                ┌──────────┐   RTSP/RTP    ┌──────────┐
-  │  Cámara  │ ─── FFmpeg ──► │ MediaMTX │ ────────────► │ Receptor │
-  │ (emisor) │                │ (server) │               │ (este    │
-  └──────────┘                └──────────┘               │  script) │
-                                                         └──────────┘
+  ┌────────────────┐                ┌──────────┐   RTSP/RTP    ┌──────────┐
+  │  RealSense     │ ─── FFmpeg ──► │ MediaMTX │ ────────────► │ Receptor │
+  │  D435 (emisor) │                │ (server) │               │ (este    │
+  └────────────────┘                └──────────┘               │  script) │
+                                                               └──────────┘
 
 Secuencia de señalización RTSP que realiza el receptor:
   1. DESCRIBE  → Solicita la descripción SDP (Session Description Protocol)
@@ -21,6 +21,13 @@ Secuencia de señalización RTSP que realiza el receptor:
 
 OpenCV maneja toda esta secuencia internamente al abrir una URL rtsp://
 con cv2.VideoCapture().
+
+El fotograma recibido es un frame combinado (RGB | Depth coloreado):
+  ┌──────────────────┬──────────────────┐
+  │   RGB (color)    │  Depth (JET)     │
+  │   640 × 480      │  640 × 480       │
+  └──────────────────┴──────────────────┘
+          → fotograma de 1280 × 480 →
 
 Uso:
     python receptor.py [URL_RTSP]
@@ -79,7 +86,7 @@ RETARDO_RECONEXION = 3
 MAX_REINTENTOS = -1
 
 # Nombre de la ventana de visualización
-NOMBRE_VENTANA = "Receptor RTSP - Video en Directo"
+NOMBRE_VENTANA = "Receptor RTSP — RealSense D435 (RGB + Profundidad)"
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -170,11 +177,19 @@ def mostrar_info_flujo(captura):
     print(f"  FPS del flujo: {fps:.1f}")
     print(f"  Backend: {int(captura.get(cv2.CAP_PROP_BACKEND))}")
 
+    # Informar que el fotograma contiene RGB y Depth lado a lado
+    if ancho > alto:
+        mitad = ancho // 2
+        print(f"  Contenido: RGB ({mitad}×{alto}) | Depth ({mitad}×{alto})")
+
 
 def dibujar_hud(fotograma, fps_actual, fotogramas_recibidos, tiempo_transcurrido):
     """
     Dibuja información de estado (HUD) sobre el fotograma.
     Muestra FPS en tiempo real, contador de fotogramas y tiempo.
+
+    Dibuja etiquetas "RGB" y "PROFUNDIDAD" sobre cada mitad del
+    fotograma combinado para identificar las regiones.
 
     Args:
         fotograma: Imagen OpenCV (numpy array BGR) donde dibujar.
@@ -185,22 +200,43 @@ def dibujar_hud(fotograma, fps_actual, fotogramas_recibidos, tiempo_transcurrido
     Retorna el fotograma con el HUD dibujado.
     """
     alto, ancho = fotograma.shape[:2]
+    mitad = ancho // 2
 
-    # Fondo semitransparente para el texto (esquina superior izquierda)
+    # ─── Fondo semitransparente para la barra de estado superior ───────
     overlay = fotograma.copy()
-    cv2.rectangle(overlay, (5, 5), (280, 75), (0, 0, 0), -1)
+    cv2.rectangle(overlay, (5, 5), (340, 75), (0, 0, 0), -1)
     cv2.addWeighted(overlay, 0.5, fotograma, 0.5, 0, fotograma)
 
     # Texto con información de estado
     fuente = cv2.FONT_HERSHEY_SIMPLEX
     color_texto = (0, 255, 0)  # Verde
 
-    cv2.putText(fotograma, f"RTSP EN VIVO", (10, 25),
+    cv2.putText(fotograma, "RTSP EN VIVO — RealSense D435", (10, 25),
                 fuente, 0.5, (0, 0, 255), 1, cv2.LINE_AA)
     cv2.putText(fotograma, f"FPS: {fps_actual:.1f} | Frames: {fotogramas_recibidos}",
                 (10, 50), fuente, 0.45, color_texto, 1, cv2.LINE_AA)
     cv2.putText(fotograma, f"Tiempo: {tiempo_transcurrido:.0f}s",
                 (10, 70), fuente, 0.45, color_texto, 1, cv2.LINE_AA)
+
+    # ─── Etiquetas de región sobre cada mitad ──────────────────────────
+    # Etiqueta "RGB" sobre la mitad izquierda
+    overlay2 = fotograma.copy()
+    cv2.rectangle(overlay2, (mitad // 2 - 30, alto - 40),
+                  (mitad // 2 + 30, alto - 10), (0, 0, 0), -1)
+    cv2.addWeighted(overlay2, 0.5, fotograma, 0.5, 0, fotograma)
+    cv2.putText(fotograma, "RGB", (mitad // 2 - 22, alto - 18),
+                fuente, 0.6, (255, 255, 255), 2, cv2.LINE_AA)
+
+    # Etiqueta "DEPTH" sobre la mitad derecha
+    overlay3 = fotograma.copy()
+    cv2.rectangle(overlay3, (mitad + mitad // 2 - 45, alto - 40),
+                  (mitad + mitad // 2 + 45, alto - 10), (0, 0, 0), -1)
+    cv2.addWeighted(overlay3, 0.5, fotograma, 0.5, 0, fotograma)
+    cv2.putText(fotograma, "DEPTH", (mitad + mitad // 2 - 38, alto - 18),
+                fuente, 0.6, (255, 255, 255), 2, cv2.LINE_AA)
+
+    # ─── Línea separadora vertical entre RGB y Depth ────────────────────
+    cv2.line(fotograma, (mitad, 0), (mitad, alto), (255, 255, 255), 1)
 
     return fotograma
 
@@ -215,6 +251,8 @@ def iniciar_receptor(url_rtsp, mostrar_hud_info=True):
 
     Se conecta a la URL RTSP indicada, recibe los paquetes RTP con
     vídeo H.264, los decodifica y muestra en una ventana de OpenCV.
+
+    El fotograma recibido contiene RGB y Depth lado a lado (1280×480).
 
     Incluye lógica de reconexión automática: si el flujo se interrumpe
     (el emisor se detiene, la red falla, etc.), el receptor espera
@@ -239,10 +277,11 @@ def iniciar_receptor(url_rtsp, mostrar_hud_info=True):
     intento = 0
 
     print("\n" + "═" * 60)
-    print("  RECEPTOR RTSP — Visualización de flujo en tiempo real")
+    print("  RECEPTOR RTSP — RealSense D435 (RGB + Profundidad)")
     print("═" * 60)
     print(f"\n  URL RTSP: {url_rtsp}")
     print(f"  Transporte: TCP entrelazado (interleaved)")
+    print(f"  Contenido esperado: RGB (izquierda) | Depth (derecha)")
     print(f"  Presiona 'q' en la ventana para salir.\n")
 
     while True:
@@ -386,7 +425,7 @@ def iniciar_receptor(url_rtsp, mostrar_hud_info=True):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Receptor RTSP: recibe y muestra un flujo de vídeo RTSP en tiempo real.",
+        description="Receptor RTSP: recibe y muestra el flujo RGB + Profundidad de una Intel RealSense D435.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Ejemplos de uso:
@@ -399,6 +438,7 @@ Notas:
   - Asegúrate de que el emisor esté corriendo antes de iniciar el receptor.
   - Ambas máquinas deben estar en la misma red local.
   - Presiona 'q' en la ventana del vídeo para cerrar el receptor.
+  - El fotograma recibido muestra RGB (izquierda) y Depth coloreado (derecha).
         """
     )
 

@@ -1,20 +1,31 @@
 #!/usr/bin/env python3
 """
-Emisor RTSP: captura vídeo de la cámara local y lo publica como flujo RTSP
+Emisor RTSP para Intel RealSense D435.
+
+Captura el flujo RGB y el flujo de profundidad usando el SDK oficial de Intel
+(pyrealsense2), colorea el mapa de profundidad con un colormap, une ambos
+fotogramas lado a lado en un solo frame y lo transmite como flujo RTSP H.264
 mediante FFmpeg + MediaMTX.
 
-Arquitectura del protocolo RTSP (Real Time Streaming Protocol):
-───────────────────────────────────────────────────────────────
-  ┌──────────┐   raw frames    ┌─────────┐   RTSP/RTP    ┌──────────┐
-  │  Cámara  │ ──────────────► │ FFmpeg  │ ────────────► │ MediaMTX │
-  │ (OpenCV) │   vía stdin     │ (H.264) │  push RTSP    │ (server) │
-  └──────────┘                 └─────────┘               └──────────┘
-                                                              │
-                                                    rtsp://<IP>:8554/camara
-                                                              │
-                                                         ┌────▼─────┐
-                                                         │ Receptor │
-                                                         └──────────┘
+Arquitectura del sistema:
+─────────────────────────
+  ┌────────────────┐  RGB + Depth   ┌────────────┐  raw frame   ┌─────────┐
+  │  Intel D435    │ ─────────────► │ Procesado  │ ───────────► │ FFmpeg  │
+  │ (pyrealsense2) │  via SDK       │ lado a lado│  vía stdin   │ (H.264) │
+  └────────────────┘                └────────────┘              └────┬────┘
+                                                                    │
+                                                              RTSP/RTP push
+                                                                    │
+                                                              ┌─────▼──────┐
+                                                              │  MediaMTX  │
+                                                              │  (server)  │
+                                                              └─────┬──────┘
+                                                                    │
+                                                          rtsp://<IP>:8554/camara
+                                                                    │
+                                                               ┌────▼─────┐
+                                                               │ Receptor │
+                                                               └──────────┘
 
 RTSP usa TCP para la señalización (DESCRIBE, SETUP, PLAY, TEARDOWN)
 y RTP sobre UDP (o TCP entrelazado) para el transporte de los paquetes
@@ -22,9 +33,10 @@ de vídeo codificados en H.264.
 
 Uso:
     python emisor.py [--puerto PUERTO] [--cam INDICE] [--calidad BITRATE_KBPS]
+    python emisor.py --listar-camaras
 
 Ejemplo:
-    python emisor.py --puerto 8554 --cam 0 --calidad 2000
+    python emisor.py --puerto 8554 --cam 0 --calidad 4000
 """
 
 import subprocess
@@ -64,6 +76,15 @@ except ImportError:
     print("  Instálalo con:  pip install -r requirements.txt")
     sys.exit(1)
 
+# ─── Intentar importar pyrealsense2 ──────────────────────────────────────
+try:
+    import pyrealsense2 as rs
+except ImportError:
+    print("Error: pyrealsense2 no está instalado.")
+    print("  Instálalo con:  pip install pyrealsense2")
+    print("  O bien:         pip install -r requirements.txt")
+    sys.exit(1)
+
 # ─── Intentar importar imageio_ffmpeg ─────────────────────────────────────
 # Este paquete incluye un binario estático de FFmpeg que se instala vía pip,
 # eliminando la necesidad de instalar FFmpeg manualmente en el sistema.
@@ -84,6 +105,11 @@ PUERTO_RTSP_DEFECTO = 8554
 
 # Ruta del flujo RTSP — los clientes se conectarán a rtsp://<IP>:<puerto>/camara
 RUTA_FLUJO = "camara"
+
+# Resolución y FPS por defecto para los flujos RealSense
+ANCHO_RS = 640
+ALTO_RS = 480
+FPS_RS = 30
 
 # Directorio donde se almacenará MediaMTX (junto al script)
 DIR_BASE = os.path.dirname(os.path.abspath(__file__))
@@ -252,21 +278,42 @@ def iniciar_mediamtx(puerto):
     return proceso_mtx
 
 
-def listar_camaras():
+def listar_camaras_realsense():
     """
-    Intenta detectar las cámaras disponibles probando índices 0-4.
-    OpenCV no tiene una API directa para enumerar dispositivos,
-    así que intentamos abrir cada índice.
+    Detecta todas las cámaras Intel RealSense conectadas al sistema
+    usando el SDK pyrealsense2.
 
-    Retorna una lista de índices de cámaras disponibles.
+    Para cada dispositivo encontrado, imprime:
+      - Índice (para usar con --cam)
+      - Nombre del dispositivo (e.g., "Intel RealSense D435")
+      - Número de serie (e.g., "038422250711")
+
+    Retorna la lista de dispositivos encontrados.
     """
-    camaras = []
-    for i in range(5):
-        cap = cv2.VideoCapture(i, cv2.CAP_DSHOW)
-        if cap.isOpened():
-            camaras.append(i)
-            cap.release()
-    return camaras
+    contexto = rs.context()
+    dispositivos = contexto.query_devices()
+
+    if len(dispositivos) == 0:
+        print("\n  ✗ No se detectaron cámaras Intel RealSense conectadas.")
+        print("    Asegúrate de que la cámara esté conectada por USB 3.0.")
+        print("    Verifica que el Intel RealSense SDK esté instalado.")
+        return []
+
+    print(f"\n  Cámaras Intel RealSense detectadas: {len(dispositivos)}")
+    print("  " + "─" * 56)
+    print(f"  {'Índice':<8} {'Nombre':<30} {'Nº de Serie'}")
+    print("  " + "─" * 56)
+
+    lista = []
+    for i, dev in enumerate(dispositivos):
+        nombre = dev.get_info(rs.camera_info.name)
+        serie = dev.get_info(rs.camera_info.serial_number)
+        print(f"  {i:<8} {nombre:<30} {serie}")
+        lista.append({"indice": i, "nombre": nombre, "serie": serie})
+
+    print("  " + "─" * 56)
+    print(f"\n  Uso: python emisor.py --cam <índice>")
+    return lista
 
 
 def obtener_ip_local():
@@ -291,21 +338,61 @@ def obtener_ip_local():
         return "127.0.0.1"
 
 
+def obtener_serial_por_indice(indice):
+    """
+    Obtiene el número de serie de la cámara RealSense en el índice dado.
+    Si solo hay una cámara y el índice es 0, retorna None para usar
+    la cámara por defecto sin filtrar por serial.
+
+    Args:
+        indice: Índice del dispositivo (0-based).
+
+    Retorna el número de serie como cadena, o None si se usa la cámara
+    por defecto (índice 0 con un solo dispositivo).
+    """
+    contexto = rs.context()
+    dispositivos = contexto.query_devices()
+
+    if len(dispositivos) == 0:
+        print("  ✗ No se detectaron cámaras Intel RealSense.")
+        sys.exit(1)
+
+    if indice >= len(dispositivos):
+        print(f"  ✗ Índice de cámara {indice} fuera de rango.")
+        print(f"    Solo hay {len(dispositivos)} cámara(s) disponible(s).")
+        print(f"    Usa --listar-camaras para ver las opciones.")
+        sys.exit(1)
+
+    # Si hay una sola cámara e índice 0, no necesitamos filtrar por serial
+    if len(dispositivos) == 1 and indice == 0:
+        return None
+
+    return dispositivos[indice].get_info(rs.camera_info.serial_number)
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # FUNCIÓN PRINCIPAL DEL EMISOR
 # ═══════════════════════════════════════════════════════════════════════════
 
 def iniciar_emisor(indice_camara=0, puerto=PUERTO_RTSP_DEFECTO, bitrate_kbps=2000):
     """
-    Función principal del emisor RTSP.
+    Función principal del emisor RTSP con Intel RealSense D435.
 
     Flujo de operación:
     1. Verifica que FFmpeg esté instalado
     2. Descarga/inicia MediaMTX (servidor RTSP)
-    3. Abre la cámara con OpenCV
+    3. Abre la cámara RealSense con pyrealsense2 (flujos RGB + Depth)
     4. Lanza FFmpeg para codificar H.264 y publicar en MediaMTX vía RTSP
-    5. Lee fotogramas de la cámara y los envía por stdin a FFmpeg
+    5. Lee fotogramas RGB y de profundidad, los une lado a lado y los envía
+       por stdin a FFmpeg
     6. FFmpeg empaqueta los fotogramas en paquetes RTP y los envía al servidor
+
+    El fotograma combinado tiene el doble de ancho (RGB | Depth coloreado):
+      ┌──────────────────┬──────────────────┐
+      │   RGB (color)    │  Depth (JET)     │
+      │   640 × 480      │  640 × 480       │
+      └──────────────────┴──────────────────┘
+              → fotograma de 1280 × 480 →
 
     Protocolo de red involucrado:
     ───────────────────────────
@@ -318,18 +405,18 @@ def iniciar_emisor(indice_camara=0, puerto=PUERTO_RTSP_DEFECTO, bitrate_kbps=200
       → Se intercambian periódicamente entre servidor y clientes
 
     Args:
-        indice_camara: Índice del dispositivo de captura (0 = cámara por defecto)
+        indice_camara: Índice del dispositivo RealSense (0 = primera cámara)
         puerto: Puerto TCP donde escuchará el servidor RTSP
         bitrate_kbps: Tasa de bits para la codificación H.264 en kbps
     """
     proceso_mediamtx = None
     proceso_ffmpeg = None
-    camara = None
+    pipeline = None
 
     try:
         # ─── Paso 1: Verificar que FFmpeg esté disponible ──────────────
         print("\n" + "═" * 60)
-        print("  EMISOR RTSP — Transmisión de cámara local")
+        print("  EMISOR RTSP — Intel RealSense D435 (RGB + Profundidad)")
         print("═" * 60)
 
         print("\n[1/4] Verificando FFmpeg (vía imageio-ffmpeg) ...")
@@ -345,35 +432,62 @@ def iniciar_emisor(indice_camara=0, puerto=PUERTO_RTSP_DEFECTO, bitrate_kbps=200
         print(f"\n[2/4] Preparando servidor RTSP (MediaMTX) ...")
         proceso_mediamtx = iniciar_mediamtx(puerto)
 
-        # ─── Paso 3: Abrir la cámara con OpenCV ───────────────────────
-        print(f"\n[3/4] Abriendo cámara (índice {indice_camara}) ...")
+        # ─── Paso 3: Abrir la cámara RealSense ────────────────────────
+        print(f"\n[3/4] Abriendo cámara Intel RealSense (índice {indice_camara}) ...")
 
-        # En Windows, usar DirectShow (CAP_DSHOW) para mejor compatibilidad
-        if platform.system() == "Windows":
-            camara = cv2.VideoCapture(indice_camara, cv2.CAP_DSHOW)
-        else:
-            camara = cv2.VideoCapture(indice_camara)
+        # Obtener el serial de la cámara seleccionada (para multi-cámara)
+        serial = obtener_serial_por_indice(indice_camara)
 
-        if not camara.isOpened():
-            print(f"  ✗ No se pudo abrir la cámara con índice {indice_camara}")
-            # Mostrar cámaras disponibles como ayuda
-            disponibles = listar_camaras()
-            if disponibles:
-                print(f"  Cámaras disponibles: {disponibles}")
-            else:
-                print("  No se detectaron cámaras conectadas.")
+        # Crear el pipeline de captura RealSense
+        pipeline = rs.pipeline()
+        config = rs.config()
+
+        # Si hay varias cámaras, seleccionar la indicada por su serial
+        if serial is not None:
+            config.enable_device(serial)
+            print(f"  → Seleccionada cámara con serial: {serial}")
+
+        # Habilitar flujo de color (RGB) a 640×480 @ 30 FPS
+        config.enable_stream(
+            rs.stream.color, ANCHO_RS, ALTO_RS, rs.format.bgr8, FPS_RS
+        )
+
+        # Habilitar flujo de profundidad (Depth) a 640×480 @ 30 FPS
+        config.enable_stream(
+            rs.stream.depth, ANCHO_RS, ALTO_RS, rs.format.z16, FPS_RS
+        )
+
+        # Iniciar el pipeline
+        try:
+            perfil = pipeline.start(config)
+        except RuntimeError as e:
+            print(f"  ✗ No se pudo iniciar la cámara RealSense: {e}")
+            print("    Verifica que la cámara esté conectada por USB 3.0.")
+            print("    Usa --listar-camaras para ver dispositivos disponibles.")
             sys.exit(1)
 
-        # Obtener las propiedades de la cámara para configurar FFmpeg
-        ancho = int(camara.get(cv2.CAP_PROP_FRAME_WIDTH))
-        alto = int(camara.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        fps = int(camara.get(cv2.CAP_PROP_FPS))
+        # Obtener información del dispositivo conectado
+        dispositivo = perfil.get_device()
+        nombre_cam = dispositivo.get_info(rs.camera_info.name)
+        serial_cam = dispositivo.get_info(rs.camera_info.serial_number)
+        firmware = dispositivo.get_info(rs.camera_info.firmware_version)
 
-        # Algunas cámaras reportan 0 FPS; usar 30 como valor seguro
-        if fps <= 0 or fps > 120:
-            fps = 30
+        print(f"  ✓ Cámara abierta: {nombre_cam}")
+        print(f"    Serial: {serial_cam}")
+        print(f"    Firmware: {firmware}")
+        print(f"    Flujo RGB:   {ANCHO_RS}×{ALTO_RS} @ {FPS_RS} FPS")
+        print(f"    Flujo Depth: {ANCHO_RS}×{ALTO_RS} @ {FPS_RS} FPS")
 
-        print(f"  ✓ Cámara abierta: {ancho}x{alto} @ {fps} FPS")
+        # El fotograma combinado tiene el doble de ancho (lado a lado)
+        ancho_combinado = ANCHO_RS * 2  # 1280
+        alto_combinado = ALTO_RS        # 480
+
+        print(f"    Fotograma combinado: {ancho_combinado}×{alto_combinado}")
+
+        # Crear el filtro de colormap para el mapa de profundidad
+        # Este filtro se puede usar opcionalmente, pero nosotros usaremos
+        # cv2.applyColorMap para mayor flexibilidad y compatibilidad
+        colorizer = rs.colorizer()
 
         # ─── Paso 4: Lanzar FFmpeg para codificar y publicar RTSP ─────
         print(f"\n[4/4] Iniciando transmisión RTSP ...")
@@ -387,7 +501,7 @@ def iniciar_emisor(indice_camara=0, puerto=PUERTO_RTSP_DEFECTO, bitrate_kbps=200
         # -f rawvideo          → El formato de entrada es vídeo crudo (sin contenedor)
         # -vcodec rawvideo     → El códec de entrada es datos crudos (sin comprimir)
         # -pix_fmt bgr24       → Formato de píxeles BGR de 24 bits (formato nativo de OpenCV)
-        # -s {ancho}x{alto}    → Resolución del vídeo de entrada
+        # -s {ancho}x{alto}    → Resolución del vídeo de entrada (1280×480 combinado)
         # -r {fps}             → Tasa de fotogramas de entrada
         # -i -                 → Leer la entrada desde stdin (pipe desde Python)
         # -c:v libx264         → Codificar el vídeo con el códec H.264 (x264)
@@ -400,23 +514,23 @@ def iniciar_emisor(indice_camara=0, puerto=PUERTO_RTSP_DEFECTO, bitrate_kbps=200
         # -rtsp_transport tcp  → Usar TCP para el transporte RTSP (más fiable en LAN)
         # {url_rtsp}           → URL de destino en el servidor MediaMTX
         comando_ffmpeg = [
-            ruta_ffmpeg,                    # Ruta al binario de FFmpeg (vía imageio-ffmpeg)
-            "-y",                           # Sobrescribir sin preguntar
-            "-f", "rawvideo",               # Formato de entrada: vídeo crudo
-            "-vcodec", "rawvideo",          # Códec de entrada: sin compresión
-            "-pix_fmt", "bgr24",            # Píxeles en BGR24 (formato OpenCV)
-            "-s", f"{ancho}x{alto}",        # Resolución del frame de entrada
-            "-r", str(fps),                 # FPS de entrada
-            "-i", "-",                      # Entrada desde stdin (pipe)
-            "-c:v", "libx264",              # Codificador H.264 (x264)
-            "-pix_fmt", "yuv420p",          # Espacio de color de salida (YUV 4:2:0)
-            "-preset", "ultrafast",         # Preset de velocidad (mínima latencia)
-            "-tune", "zerolatency",         # Sintonizar para latencia cero
-            "-b:v", f"{bitrate_kbps}k",     # Bitrate de salida en kbps
-            "-g", str(fps * 2),             # Tamaño del GOP (Group of Pictures)
-            "-f", "rtsp",                   # Formato de salida: RTSP
-            "-rtsp_transport", "tcp",       # Transporte RTSP sobre TCP
-            url_rtsp                        # URL de destino RTSP
+            ruta_ffmpeg,                              # Ruta al binario de FFmpeg
+            "-y",                                     # Sobrescribir sin preguntar
+            "-f", "rawvideo",                         # Formato de entrada: vídeo crudo
+            "-vcodec", "rawvideo",                    # Códec de entrada: sin compresión
+            "-pix_fmt", "bgr24",                      # Píxeles en BGR24 (formato OpenCV)
+            "-s", f"{ancho_combinado}x{alto_combinado}",  # Resolución combinada
+            "-r", str(FPS_RS),                        # FPS de entrada
+            "-i", "-",                                # Entrada desde stdin (pipe)
+            "-c:v", "libx264",                        # Codificador H.264 (x264)
+            "-pix_fmt", "yuv420p",                    # Espacio de color de salida
+            "-preset", "ultrafast",                   # Preset de velocidad
+            "-tune", "zerolatency",                   # Sintonizar para latencia cero
+            "-b:v", f"{bitrate_kbps}k",               # Bitrate de salida en kbps
+            "-g", str(FPS_RS * 2),                    # Tamaño del GOP
+            "-f", "rtsp",                             # Formato de salida: RTSP
+            "-rtsp_transport", "tcp",                 # Transporte RTSP sobre TCP
+            url_rtsp                                  # URL de destino RTSP
         ]
 
         # Iniciar el proceso FFmpeg con stdin como pipe para enviar fotogramas
@@ -446,33 +560,71 @@ def iniciar_emisor(indice_camara=0, puerto=PUERTO_RTSP_DEFECTO, bitrate_kbps=200
         print(f"  URL RTSP del flujo:")
         print(f"  → rtsp://{ip_local}:{puerto}/{RUTA_FLUJO}")
         print(f"")
+        print(f"  Contenido: RGB (izquierda) | Profundidad (derecha)")
+        print(f"  Resolución: {ancho_combinado}×{alto_combinado}")
+        print(f"  Bitrate: {bitrate_kbps} kbps")
+        print(f"")
         print(f"  Los receptores deben conectarse a esta URL.")
         print(f"  También puedes probar con VLC: Medio → Abrir ubicación de red")
         print("═" * 60)
         print("\n  Presiona Ctrl+C para detener la transmisión.\n")
 
         # ─── Bucle principal: capturar y enviar fotogramas ─────────────
-        # Cada fotograma capturado por OpenCV se escribe como bytes crudos
-        # en el stdin de FFmpeg. FFmpeg los codifica en H.264, los empaqueta
-        # en paquetes RTP y los envía al servidor MediaMTX por RTSP/TCP.
+        # Cada par de fotogramas (RGB + Depth) se procesa así:
+        #   1. Se capturan ambos flujos sincronizados del pipeline RealSense
+        #   2. El flujo de profundidad (Z16, 16-bit) se normaliza a 8 bits
+        #   3. Se aplica cv2.applyColorMap con COLORMAP_JET para colorear
+        #   4. Se concatenan lado a lado con np.hstack
+        #   5. El fotograma combinado se escribe como bytes crudos en stdin de FFmpeg
         fotogramas_enviados = 0
         tiempo_inicio = time.time()
 
         while True:
-            # Leer un fotograma de la cámara
-            ret, fotograma = camara.read()
-
-            if not ret:
-                # Si la lectura falla (cámara desconectada, etc.)
-                print("  ⚠ Error al leer de la cámara, reintentando...")
-                time.sleep(0.1)
+            # Esperar un conjunto sincronizado de fotogramas (RGB + Depth)
+            # pipeline.wait_for_frames() bloquea hasta que ambos flujos
+            # tengan un fotograma disponible con timestamp coincidente
+            try:
+                frames = pipeline.wait_for_frames(timeout_ms=5000)
+            except RuntimeError:
+                print("  ⚠ Timeout esperando fotogramas de la cámara...")
                 continue
 
+            # Extraer el fotograma de color (RGB en formato BGR8)
+            frame_color = frames.get_color_frame()
+            # Extraer el fotograma de profundidad (Z16, 16 bits por píxel)
+            frame_depth = frames.get_depth_frame()
+
+            if not frame_color or not frame_depth:
+                # Si alguno de los flujos no está listo, saltar
+                continue
+
+            # ─── Convertir fotogramas a arrays numpy ───────────────────
+            # frame_color → numpy array de shape (480, 640, 3), dtype uint8, BGR
+            imagen_color = np.asanyarray(frame_color.get_data())
+
+            # frame_depth → numpy array de shape (480, 640), dtype uint16
+            # Contiene distancias en milímetros (rango típico: 0-10000)
+            datos_depth = np.asanyarray(frame_depth.get_data())
+
+            # ─── Colorear el mapa de profundidad ──────────────────────
+            # Paso 1: Normalizar de uint16 (0-65535) a uint8 (0-255)
+            # Usamos cv2.convertScaleAbs que satura en 255 automáticamente
+            # El factor alpha controla la escala: 0.03 mapea ~8500mm a 255
+            depth_normalizado = cv2.convertScaleAbs(datos_depth, alpha=0.03)
+
+            # Paso 2: Aplicar mapa de colores JET para visualización
+            # COLORMAP_JET: azul (cerca) → verde (medio) → rojo (lejos)
+            depth_coloreado = cv2.applyColorMap(depth_normalizado, cv2.COLORMAP_JET)
+
+            # ─── Unir ambos fotogramas lado a lado ─────────────────────
+            # hstack: RGB a la izquierda, Depth coloreado a la derecha
+            # Resultado: array de shape (480, 1280, 3), dtype uint8, BGR
+            fotograma_combinado = np.hstack((imagen_color, depth_coloreado))
+
             try:
-                # Escribir los bytes crudos del fotograma en el stdin de FFmpeg
-                # El fotograma tiene formato BGR24 con shape (alto, ancho, 3)
-                # Total de bytes por fotograma = ancho × alto × 3
-                proceso_ffmpeg.stdin.write(fotograma.tobytes())
+                # Escribir los bytes crudos del fotograma combinado en stdin de FFmpeg
+                # Total de bytes por fotograma = 1280 × 480 × 3 = 1,843,200 bytes
+                proceso_ffmpeg.stdin.write(fotograma_combinado.tobytes())
                 fotogramas_enviados += 1
 
                 # Mostrar estadísticas cada 100 fotogramas
@@ -523,10 +675,13 @@ def iniciar_emisor(indice_camara=0, puerto=PUERTO_RTSP_DEFECTO, bitrate_kbps=200
                 proceso_ffmpeg.kill()
                 print("  ✓ FFmpeg forzado a detener")
 
-        # Liberar la cámara
-        if camara and camara.isOpened():
-            camara.release()
-            print("  ✓ Cámara liberada")
+        # Detener el pipeline RealSense y liberar la cámara
+        if pipeline is not None:
+            try:
+                pipeline.stop()
+                print("  ✓ Cámara RealSense liberada")
+            except Exception:
+                pass
 
         # Detener el servidor MediaMTX
         if proceso_mediamtx and proceso_mediamtx.poll() is None:
@@ -548,14 +703,15 @@ def iniciar_emisor(indice_camara=0, puerto=PUERTO_RTSP_DEFECTO, bitrate_kbps=200
 if __name__ == "__main__":
     # Parsear argumentos de línea de comandos
     parser = argparse.ArgumentParser(
-        description="Emisor RTSP: transmite la cámara local por protocolo RTSP.",
+        description="Emisor RTSP: transmite vídeo RGB + Profundidad de una cámara Intel RealSense D435.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Ejemplos de uso:
   python emisor.py                          # Cámara 0, puerto 8554, 2000 kbps
-  python emisor.py --cam 1                  # Usar segunda cámara
+  python emisor.py --cam 1                  # Usar segunda cámara RealSense
   python emisor.py --puerto 9554            # Usar puerto alternativo
   python emisor.py --calidad 4000           # Mayor calidad de vídeo
+  python emisor.py --listar-camaras         # Ver cámaras RealSense detectadas
   python emisor.py --cam 0 --puerto 8554    # Todos los parámetros explícitos
         """
     )
@@ -570,7 +726,7 @@ Ejemplos de uso:
         "--cam",
         type=int,
         default=0,
-        help="Índice de la cámara a usar (por defecto: 0)"
+        help="Índice de la cámara RealSense a usar (por defecto: 0)"
     )
     parser.add_argument(
         "--calidad",
@@ -581,19 +737,15 @@ Ejemplos de uso:
     parser.add_argument(
         "--listar-camaras",
         action="store_true",
-        help="Listar cámaras disponibles y salir"
+        help="Listar cámaras Intel RealSense conectadas y salir"
     )
 
     args = parser.parse_args()
 
-    # Si se pide listar cámaras, mostrar y salir
+    # Si se pide listar cámaras, mostrar info de RealSense y salir
     if args.listar_camaras:
-        print("Buscando cámaras disponibles ...")
-        camaras = listar_camaras()
-        if camaras:
-            print(f"  Cámaras detectadas en índices: {camaras}")
-        else:
-            print("  No se detectaron cámaras.")
+        print("Buscando cámaras Intel RealSense ...")
+        listar_camaras_realsense()
         sys.exit(0)
 
     # Iniciar el emisor con los parámetros proporcionados
