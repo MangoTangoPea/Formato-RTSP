@@ -430,18 +430,90 @@ Puedes probar el flujo RTSP con cualquier reproductor compatible. En VLC:
 
 ---
 
+## Ejecución en Linux / Ubuntu
+
+Este proyecto incluye versiones dedicadas para Linux/Ubuntu: `emisor_ubuntu.py` y `receptor_ubuntu.py`.
+
+### Requisitos del sistema (Ubuntu/Debian)
+
+```bash
+sudo apt update
+sudo apt install python3-venv python3-pip libgl1 libglib2.0-0
+```
+
+### Crear entorno virtual e instalar dependencias
+
+```bash
+cd /ruta/al/proyecto
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+### Ejecutar el emisor (máquina con la cámara RealSense)
+
+```bash
+source .venv/bin/activate
+python3 emisor_ubuntu.py
+```
+
+> **Nota:** La primera ejecución descarga automáticamente MediaMTX para Linux en la carpeta `mediamtx_linux/`.
+
+**Opciones del emisor:**
+
+```bash
+python3 emisor_ubuntu.py --puerto 8554     # Puerto RTSP (por defecto: 8554)
+python3 emisor_ubuntu.py --cam 1           # Usar segunda cámara
+python3 emisor_ubuntu.py --calidad 4000    # Mayor calidad de vídeo (kbps)
+python3 emisor_ubuntu.py --listar-camaras  # Ver cámaras disponibles
+```
+
+### Ejecutar el receptor (otra máquina Linux)
+
+```bash
+source .venv/bin/activate
+python3 receptor_ubuntu.py 192.168.1.42
+```
+
+### Nota sobre WSL (Windows Subsystem for Linux)
+
+| Componente | ¿Funciona en WSL2? | Notas |
+|------------|-------------------|-------|
+| **Receptor** | ✅ Sí | Necesita WSLg (Windows 11) o un servidor X como VcXsrv (Windows 10) para la ventana gráfica. |
+| **Emisor** | ⚠️ Limitado | La cámara RealSense es USB físico. WSL2 no la ve directamente. Requiere `usbipd-win` para hacer passthrough del USB, lo cual es complejo y frágil. **Recomendación:** usar el emisor en Windows nativo o en un Ubuntu real. |
+
+### Permisos USB para RealSense en Linux nativo
+
+Si la cámara no es detectada en Linux, es posible que necesites instalar las reglas udev de Intel RealSense:
+
+```bash
+# Opción 1: Instalar librealsense desde el repositorio oficial de Intel
+# Ver: https://github.com/IntelRealSense/librealsense/blob/master/doc/distribution_linux.md
+
+# Opción 2: Copiar las reglas udev manualmente
+sudo cp 99-realsense-libusb.rules /etc/udev/rules.d/
+sudo udevadm control --reload-rules && sudo udevadm trigger
+```
+
+---
+
 ## Estructura del proyecto
 
 ```
 Demo RTSP/
-├── emisor.py           # Script del emisor (captura + FFmpeg + MediaMTX)
-├── receptor.py         # Script del receptor (cliente RTSP + visualización)
-├── requirements.txt    # Dependencias de Python (opencv-python, numpy)
-├── README.md           # Esta documentación
-├── mediamtx/           # (generado automáticamente al ejecutar emisor.py)
-│   ├── mediamtx.exe    #   Servidor RTSP (descargado de GitHub)
-│   └── mediamtx.yml    #   Configuración del servidor
-└── .venv/              # Entorno virtual de Python
+├── emisor.py              # Emisor para Windows (captura + FFmpeg + MediaMTX)
+├── emisor_ubuntu.py       # Emisor para Linux/Ubuntu
+├── receptor.py            # Receptor para Windows (cliente RTSP + visualización)
+├── receptor_ubuntu.py     # Receptor para Linux/Ubuntu
+├── requirements.txt       # Dependencias de Python (opencv-python, numpy, etc.)
+├── README.md              # Esta documentación
+├── mediamtx/              # (generado automáticamente en Windows)
+│   ├── mediamtx.exe       #   Servidor RTSP (descargado de GitHub)
+│   └── mediamtx.yml       #   Configuración del servidor
+├── mediamtx_linux/        # (generado automáticamente en Linux)
+│   ├── mediamtx           #   Servidor RTSP (binario Linux)
+│   └── mediamtx.yml       #   Configuración del servidor
+└── .venv/                 # Entorno virtual de Python
 ```
 
 ---
@@ -452,3 +524,4 @@ Demo RTSP/
 - MediaMTX permite múltiples receptores simultáneos conectados al mismo flujo.
 - También puedes verificar el flujo con VLC, ffplay, o cualquier reproductor RTSP.
 - Para producción, considera añadir autenticación RTSP (MediaMTX lo soporta vía `mediamtx.yml`) y cifrado TLS/SRTP.
+- Los archivos `*_ubuntu.py` son equivalentes funcionales a los de Windows, adaptados para Linux (descarga de MediaMTX `.tar.gz`, permisos `chmod +x`, sin `CREATE_NO_WINDOW`).

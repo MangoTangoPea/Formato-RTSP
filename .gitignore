@@ -1,8 +1,9 @@
 # Entorno virtual de Python
 .venv/
 
-# MediaMTX (servidor RTSP, descargado automáticamente por emisor.py)
+# MediaMTX (servidor RTSP, descargado automáticamente)
 mediamtx/
+mediamtx_linux/
 
 # Cache de Python
 __pycache__/

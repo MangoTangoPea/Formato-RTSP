@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """
-Receptor RTSP Multicanal: se conecta a 4 flujos RTSP independientes de la
-cámara Intel RealSense D435 (Color, IR1, IR2, Depth) usando hilos dedicados
-y los muestra en tiempo real con controles interactivos en OpenCV.
+Receptor RTSP Multicanal — Versión Linux/Ubuntu.
+
+Se conecta a 4 flujos RTSP independientes de la cámara Intel RealSense D435
+(Color, IR1, IR2, Depth) usando hilos dedicados y los muestra en tiempo real
+con controles interactivos en OpenCV.
 
 Arquitectura de recepción:
 ──────────────────────────
@@ -15,6 +17,13 @@ Arquitectura de recepción:
   │                 │      RTSP/RTP (/ir2)   ├───────────────────┤   │   - Cambio de vistas
   │                 │ ─────────────────────► │ Reader-IR2        │ ──┘
   └─────────────────┘                        └───────────────────┘
+
+Requisitos en Ubuntu/Debian:
+    sudo apt update
+    sudo apt install python3-venv python3-pip libgl1 libglib2.0-0
+    python3 -m venv .venv
+    source .venv/bin/activate
+    pip install -r requirements.txt
 
 Teclas de control en la ventana:
   - 'm' o 'M': Modo Mosaico (RGB superior, IR1/Depth/IR2 inferiores).
@@ -31,14 +40,6 @@ import argparse
 import os
 import threading
 
-# ─── Configurar la codificación de la consola para Unicode en Windows ─────
-if sys.platform.startswith("win"):
-    try:
-        sys.stdout.reconfigure(encoding="utf-8")
-        sys.stderr.reconfigure(encoding="utf-8")
-    except AttributeError:
-        pass
-
 # ─── Intentar importar librerías necesarias ──────────────────────────────
 try:
     import cv2
@@ -46,6 +47,7 @@ try:
 except ImportError:
     print("Error: opencv-python y numpy son obligatorios.")
     print("  Instálalo con:  pip install -r requirements.txt")
+    print("  Si falta libGL:  sudo apt install libgl1 libglib2.0-0")
     sys.exit(1)
 
 
@@ -54,7 +56,7 @@ except ImportError:
 # ═══════════════════════════════════════════════════════════════════════════
 
 PUERTO_RTSP_DEFECTO = 8554
-NOMBRE_VENTANA = "Receptor RTSP — RealSense D435"
+NOMBRE_VENTANA = "Receptor RTSP — RealSense D435 (Linux)"
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -252,7 +254,7 @@ def iniciar_receptor(url_base_ip, puerto, mostrar_hud_info=True):
     url_ir2 = f"rtsp://{url_base_ip}:{puerto}/ir2"
 
     print("\n" + "═" * 60)
-    print("  RECEPTOR RTSP MULTICANAL — RealSense D435")
+    print("  RECEPTOR RTSP MULTICANAL — RealSense D435 (Linux)")
     print("═" * 60)
     print(f"  Color (RGB):   {url_color}")
     print(f"  Depth Map:     {url_depth}")
@@ -428,21 +430,26 @@ def iniciar_receptor(url_base_ip, puerto, mostrar_hud_info=True):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Receptor RTSP: recibe y muestra el mosaico de 4 streams de una Intel RealSense D435.",
+        description="Receptor RTSP Multicanal (Linux/Ubuntu): recibe y visualiza 4 flujos independientes de una Intel RealSense D435.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Ejemplos de uso:
-  python receptor.py rtsp://192.168.1.42:8554/camara      # URL completa
-  python receptor.py 192.168.1.42                          # IP con puerto/ruta por defecto
-  python receptor.py 192.168.1.42 8554                     # IP y puerto
-  python receptor.py --sin-hud rtsp://192.168.1.42:8554/camara  # Sin overlay de info
+  python3 receptor_ubuntu.py rtsp://192.168.1.42:8554/camara      # Extrae la IP e inicia los 4 canales
+  python3 receptor_ubuntu.py 192.168.1.42                          # IP con puerto/rutas por defecto
+  python3 receptor_ubuntu.py 192.168.1.42 8554                     # IP y puerto alternativo
+  python3 receptor_ubuntu.py --sin-hud 192.168.1.42                # Sin overlay de info OSD
 
-Notas:
-  - Asegúrate de que el emisor esté corriendo antes de iniciar el receptor.
-  - Ambas máquinas deben estar en la misma red local.
-  - Presiona 'q' en la ventana del vídeo para cerrar el receptor.
-  - El mosaico recibido contiene: RGB + IR1 + Depth (heatmap) + IR2.
-  - La ventana es redimensionable (arrastrar bordes para ajustar tamaño).
+Requisitos previos en Ubuntu/Debian:
+  sudo apt update
+  sudo apt install python3-venv python3-pip libgl1 libglib2.0-0
+  python3 -m venv .venv
+  source .venv/bin/activate
+  pip install -r requirements.txt
+
+Nota WSL2 (Windows Subsystem for Linux):
+  - El receptor funciona en WSL2 con WSLg (Windows 11).
+  - En Windows 10, necesitas un servidor X como VcXsrv.
+  - Asegurate de que la IP del emisor sea alcanzable desde WSL.
         """
     )
 
@@ -462,7 +469,7 @@ Notas:
     parser.add_argument(
         "--sin-hud",
         action="store_true",
-        help="No mostrar información de estado (HUD) sobre el vídeo"
+        help="No mostrar información de estado (OSD) sobre los paneles"
     )
 
     args = parser.parse_args()
