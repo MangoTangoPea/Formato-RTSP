@@ -2,4 +2,3 @@ pyrealsense2
 opencv-python
 numpy
 imageio-ffmpeg
-python-librealsense
