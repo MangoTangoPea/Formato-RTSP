@@ -1,23 +1,29 @@
-# Demo RTSP — Transmisión de vídeo con protocolo RTSP real (Emisor / Receptor)
+# Demo RTSP — Transmisión de Mosaico RealSense D435 con Protocolo RTSP (Emisor / Receptor)
 
-Sistema de transmisión de vídeo tipo cliente-servidor que funciona en red local entre dos computadoras utilizando el protocolo **RTSP** (Real Time Streaming Protocol, RFC 2326).
+Sistema de transmisión de vídeo en tiempo real en red local utilizando el protocolo **RTSP** (Real Time Streaming Protocol, RFC 2326). El emisor captura streams simultáneos (RGB, Infrarojos y Profundidad) de una cámara **Intel RealSense D435**, compone un mosaico de alta resolución (1920x1440) con OSD y lo transmite de forma fluida.
 
 ## Arquitectura del sistema
 
 ```
-  ┌──────────┐   frames crudos   ┌─────────┐   RTSP/RTP    ┌──────────┐
-  │  Cámara  │ ────────────────► │ FFmpeg  │ ────────────► │ MediaMTX │
-  │ (OpenCV) │   vía pipe/stdin  │ (H.264) │  ANNOUNCE +   │ (server  │
-  │          │                   │         │  RECORD        │  RTSP)   │
-  └──────────┘                   └─────────┘               └────┬─────┘
-     emisor.py                                                  │
-                                                      rtsp://<IP>:8554/camara
-                                                                │
-                                                           ┌────▼─────┐
-                                                           │ Receptor │
-                                                           │ (OpenCV) │
-                                                           └──────────┘
-                                                            receptor.py
+  ┌──────────────────┐               
+  │  RealSense D435  │               
+  │ (RGB, Depth, IR) │               
+  └────────┬─────────┘               
+           │ (4 streams)             
+           ▼                         
+      ┌──────────┐    mosaico raw     ┌─────────┐   RTSP/RTP    ┌──────────┐
+      │  Emisor  │ ─────────────────► │ FFmpeg  │ ────────────► │ MediaMTX │
+      │ (Python) │   vía pipe/stdin   │ (H.264) │  ANNOUNCE +   │ (server  │
+      │          │   (1920x1440 BGR)  │         │  RECORD        │  RTSP)   │
+      └──────────┘                    └─────────┘               └────┬─────┘
+       emisor.py                                                     │
+                                                          rtsp://<IP>:8554/camara
+                                                                     │
+                                                                ┌────▼─────┐
+                                                                │ Receptor │
+                                                                │ (OpenCV) │
+                                                                └──────────┘
+                                                                 receptor.py
 ```
 
 ### ¿Qué es RTSP?
@@ -36,14 +42,26 @@ Sistema de transmisión de vídeo tipo cliente-servidor que funciona en red loca
 
 | Componente | Rol | Descripción |
 |------------|-----|-------------|
-| **`emisor.py`** | Publicador RTSP | Captura la cámara con OpenCV, envía frames crudos a FFmpeg vía stdin. FFmpeg codifica en H.264 y publica al servidor MediaMTX. |
-| **`receptor.py`** | Cliente RTSP | Se conecta a la URL RTSP, recibe paquetes RTP, decodifica H.264 y muestra el vídeo en una ventana OpenCV. |
-| **MediaMTX** | Servidor RTSP | Servidor ligero que redistribuye el flujo a múltiples clientes. Se descarga automáticamente al ejecutar el emisor. |
-| **FFmpeg** | Codificador | Convierte vídeo crudo BGR a H.264 y lo empaqueta en RTSP/RTP. Se incluye automáticamente mediante `imageio-ffmpeg`. |
+| **`emisor.py`** | Publicador RTSP | Captura 4 flujos nativos (Color, Depth, IR1, IR2) de la Intel RealSense D435, compone el mosaico, añade overlays de texto HUD, y envía el canvas raw (1920x1440) a FFmpeg vía stdin. |
+| **`receptor.py`** | Cliente RTSP | Se conecta al servidor, recibe y decodifica el flujo de mosaico H.264 para mostrarlo en tiempo real. |
+| **MediaMTX** | Servidor RTSP (Broker) | Servidor ligero de alta velocidad que gestiona el streaming RTSP. Recibe la publicación de FFmpeg y la retransmite bajo demanda. |
+| **FFmpeg** | Codificador de Vídeo | Codifica en tiempo real los frames crudos BGR24 en paquetes H.264 comprimidos de baja latencia. |
+
+### ¿Para qué se usa MediaMTX en este proyecto?
+
+**MediaMTX** (anteriormente conocido como rtsp-simple-server) es un servidor multimedia e intermediario de streaming ("RTSP broker") de alto rendimiento. En este proyecto cumple un papel crítico:
+
+1. **Multiplexado de Clientes**: Una cámara física RealSense solo puede estar abierta por un proceso de captura a la vez. MediaMTX permite que el emisor envíe el vídeo **una sola vez** al servidor, y este se encarga de retransmitir el flujo simultáneamente a todos los clientes (receptores) que se conecten, sin saturar la cámara.
+2. **Puente entre Codificador y Clientes**: FFmpeg se encarga de codificar pero no actúa como un servidor de red pasivo. MediaMTX corre de fondo esperando conexiones, y permite a FFmpeg publicar su flujo mediante el comando `ANNOUNCE` y `RECORD`, manteniendo el canal abierto.
+3. **Capa de Control de Protocolo**: Gestiona la señalización formal de la comunicación RTSP (DESCRIBE, SETUP, PLAY, TEARDOWN) y el multiplexado de los paquetes de datos RTP/RTCP tanto por UDP como por TCP.
 
 ---
 
 ## Requisitos previos
+
+### Hardware requerido
+* **Cámara Intel RealSense D435** conectada a la máquina emisora.
+* **Puerto y Cable USB 3.0**: Es estrictamente necesario conectar la cámara a un puerto USB 3.0 nativo (color azul o con etiqueta SS). Los puertos USB 2.0 limitan severamente el ancho de banda, lo que causará fallos de inicialización al solicitar transmisiones HD y sub-HD simultáneas.
 
 ### Software necesario
 
@@ -51,6 +69,7 @@ Sistema de transmisión de vídeo tipo cliente-servidor que funciona en red loca
 |-----------|---------------|-----------------|-------------|
 | Python | 3.8+ | `python --version` | [python.org](https://www.python.org/downloads/) |
 | FFmpeg | 4.0+ | (Gestionado automáticamente por `imageio-ffmpeg`) | Se instala automáticamente vía `pip install -r requirements.txt` |
+| SDK Intel RealSense | Drivers básicos | Automático en Windows 10/11 | Conectar el hardware |
 | pip | (incluido con Python) | `pip --version` | — |
 
 > **Nota:** MediaMTX se descarga **automáticamente** la primera vez que ejecutas `emisor.py`. No necesitas instalarlo manualmente.
@@ -73,9 +92,10 @@ pip install -r requirements.txt
 ```
 
 Las dependencias de Python son:
-- **`opencv-python`**: captura de cámara, decodificación H.264 y visualización de vídeo.
-- **`numpy`**: manipulación de arrays de píxeles (requerido por OpenCV).
-- **`imageio-ffmpeg`**: proporciona y gestiona el binario ejecutable de FFmpeg dentro del entorno de Python de forma automática.
+- **`opencv-python`**: visualización, procesamiento de imágenes (Jet heatmap) y utilidades de OSD.
+- **`numpy`**: operaciones matriciales rápidas para la concatenación del mosaico.
+- **`imageio-ffmpeg`**: proporciona el binario estático de FFmpeg.
+- **`pyrealsense2`**: SDK oficial de Intel para la comunicación de bajo nivel con la cámara RealSense D435.
 
 Para salir del entorno virtual:
 
@@ -162,7 +182,7 @@ ipconfig
 
 Busca la línea **"Dirección IPv4"** y copia ese número. Por ejemplo: `192.168.1.42`
 
-### Paso 2: Ejecuta el emisor (máquina con la cámara)
+### Paso 2: Ejecuta el emisor (máquina con la cámara RealSense)
 
 ```powershell
 cd "C:\ruta\al\proyecto"
@@ -376,21 +396,25 @@ Puedes probar el flujo RTSP con cualquier reproductor compatible. En VLC:
 
 ### `emisor.py` — Detalle técnico
 
-1. **Verificación de FFmpeg:** El script comprueba que `ffmpeg` esté accesible ejecutando `ffmpeg -version`.
-
-2. **MediaMTX (Servidor RTSP):** Se descarga automáticamente desde GitHub Releases la primera vez. MediaMTX es un servidor RTSP/RTMP/HLS/WebRTC de un solo binario sin dependencias. Se inicia como proceso hijo y escucha en el puerto 8554 por defecto. La variable de entorno `MTX_RTSPADDRESS` permite cambiar el puerto.
-
-3. **Captura con OpenCV:** `cv2.VideoCapture(0, cv2.CAP_DSHOW)` abre la cámara usando DirectShow en Windows. Se leen las propiedades de resolución y FPS para configurar FFmpeg correctamente.
-
-4. **Codificación y publicación con FFmpeg:**
-   - Se lanza FFmpeg como subproceso con `stdin=subprocess.PIPE`
-   - Formato de entrada: vídeo crudo BGR24 (el formato nativo de OpenCV)
-   - Codificador: `libx264` con `preset=ultrafast` y `tune=zerolatency` para mínima latencia
-   - Formato de salida: RTSP sobre TCP
-   - FFmpeg envía ANNOUNCE + SETUP + RECORD al servidor MediaMTX
-   - Cada fotograma capturado se escribe como bytes crudos en el stdin de FFmpeg
-
-5. **Manejo de errores:** `try/finally` asegura que todos los procesos (FFmpeg, MediaMTX) se detengan y la cámara se libere al salir.
+1. **Verificación de FFmpeg:** Comprueba que FFmpeg esté accesible en la ruta del entorno de Python.
+2. **MediaMTX (Servidor RTSP):** Descarga el binario oficial de MediaMTX en el directorio `mediamtx` y lo ejecuta como proceso hijo, abstrayendo al usuario de configuraciones complejas y actuando como broker.
+3. **Captura de RealSense D435 (`pyrealsense2`):**
+   - Configura streams paralelos sin compresión: RGB a 1080p y Profundidad/Infrarrojos a 720p.
+   - Controla de forma nativa la tasa estable de 30 FPS en los 4 sensores.
+4. **Procesamiento de Imágenes**:
+   - **Mapa de Calor (Depth Heatmap)**: Convierte la lectura de 16 bits en milímetros a una representación visual de 8 bits segmentada a 4 metros, aplicando `cv2.applyColorMap(..., cv2.COLORMAP_JET)`. Modifica los píxeles de valor `0` (ruido o fuera de rango) a negro absoluto `(0, 0, 0)` para mayor nitidez.
+   - **Formato de Color**: Convierte los streams infrarrojos Y8 (escala de grises) a BGR24 para permitir la concatenación matricial de canales.
+5. **Composición Matemática del Mosaico**:
+   - Redimensiona las tres vistas inferiores a un ancho uniforme de `640px` (el alto correspondiente es `360px` para sostener la relación de aspecto 16:9).
+   - Fusiona horizontalmente las tres cámaras inferiores: `bottom_row = np.hstack([ir_left, depth_heatmap, ir_right])` dando una resolución de `1920x360`.
+   - Fusiona verticalmente la cámara color principal `1920x1080` sobre la fila inferior, completando el lienzo maestro en `1920x1440`.
+6. **Overlay OSD (En Pantalla)**:
+   - Dibuja en cada esquina superior izquierda un rectángulo de opacidad controlada (`alpha=0.6`) con `cv2.rectangle` y `cv2.addWeighted`.
+   - Inserta con `cv2.putText` la información en tiempo real de nombre de cámara, FPS del emisor, contador acumulado, tiempo de uptime y resoluciones nativas.
+7. **FFmpeg y Transmisión de Flujo**:
+   - Envía el lienzo de `1920x1440` sin comprimir por bytes crudos a la entrada estándar (`stdin`) del codificador FFmpeg.
+   - FFmpeg encapsula con el códec `libx264` y el preset `ultrafast` + `tune=zerolatency` para publicar al servidor local mediante paquetes RTP encapsulados sobre TCP (para superar barreras de firewall).
+8. **Manejo de errores:** `try/finally` detiene de manera controlada el pipeline de sensores de RealSense, el flujo de entrada de FFmpeg y el proceso del servidor MediaMTX para evitar bloqueos del hardware USB.
 
 ### `receptor.py` — Detalle técnico
 

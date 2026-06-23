@@ -27,8 +27,8 @@ Uso:
     python receptor.py [IP_EMISOR] [PUERTO]
 
 Ejemplos:
-    python receptor.py rtsp://192.168.1.42:8554/camara
-    python receptor.py 192.168.1.42 8554
+    python receptor.py rtsp://[IP_ADDRESS]/camara
+    python receptor.py [IP_ADDRESS]
 """
 
 import sys

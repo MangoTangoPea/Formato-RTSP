@@ -74,6 +74,14 @@ except ImportError:
     print("  Instálalo con:  pip install -r requirements.txt")
     sys.exit(1)
 
+# ─── Intentar importar pyrealsense2 ───────────────────────────────────────
+try:
+    import pyrealsense2 as rs
+except ImportError:
+    print("Error: pyrealsense2 no está instalado.")
+    print("  Instálalo con:  pip install -r requirements.txt")
+    sys.exit(1)
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # CONSTANTES Y CONFIGURACIÓN POR DEFECTO
@@ -254,18 +262,18 @@ def iniciar_mediamtx(puerto):
 
 def listar_camaras():
     """
-    Intenta detectar las cámaras disponibles probando índices 0-4.
-    OpenCV no tiene una API directa para enumerar dispositivos,
-    así que intentamos abrir cada índice.
-
-    Retorna una lista de índices de cámaras disponibles.
+    Lista los dispositivos Intel RealSense conectados.
+    Retorna una lista con información de cada cámara detectada.
     """
     camaras = []
-    for i in range(5):
-        cap = cv2.VideoCapture(i, cv2.CAP_DSHOW)
-        if cap.isOpened():
-            camaras.append(i)
-            cap.release()
+    try:
+        ctx = rs.context()
+        for dev in ctx.query_devices():
+            nombre = dev.get_info(rs.camera_info.name)
+            sn = dev.get_info(rs.camera_info.serial_number)
+            camaras.append(f"{nombre} [S/N: {sn}]")
+    except Exception as e:
+        print(f"  ✗ Error al consultar dispositivos RealSense: {e}")
     return camaras
 
 
@@ -291,45 +299,81 @@ def obtener_ip_local():
         return "127.0.0.1"
 
 
+def dibujar_hud_realsense(canvas, x_offset, y_offset, titulo, fps, frames, segundos, resolucion):
+    """
+    Dibuja un HUD con fondo gris oscuro semitransparente y 3 líneas de texto:
+      - Línea 1 (Rojo BGR): Nombre del stream (Live | RGB, Live | Infrarojo 1, etc.)
+      - Línea 2 (Verde BGR): FPS y contador de fotogramas
+      - Línea 3 (Verde BGR): Tiempo transcurrido y resolución original
+      
+    Args:
+        canvas: Lienzo maestro completo (numpy array BGR de 1920x1440).
+        x_offset: Desplazamiento X del stream en el mosaico.
+        y_offset: Desplazamiento Y del stream en el mosaico.
+        titulo: Nombre descriptivo del stream.
+        fps: FPS calculados del stream.
+        frames: Contador total de fotogramas.
+        segundos: Tiempo transcurrido en segundos.
+        resolucion: Resolución original del stream.
+    """
+    # Caja de fondo (semitransparente gris oscuro)
+    # Margen de 10px desde la esquina superior izquierda del stream
+    box_x1 = x_offset + 10
+    box_y1 = y_offset + 10
+    box_x2 = x_offset + 330
+    box_y2 = y_offset + 85
+    
+    # Crear un overlay temporal para la transparencia
+    overlay = canvas.copy()
+    cv2.rectangle(overlay, (box_x1, box_y1), (box_x2, box_y2), (40, 40, 40), -1)
+    
+    # Mezclar el overlay con el canvas original (60% opacidad del rectángulo)
+    cv2.addWeighted(overlay, 0.6, canvas, 0.4, 0, canvas)
+    
+    # Parámetros del texto
+    fuente = cv2.FONT_HERSHEY_SIMPLEX
+    escala = 0.45
+    grosor = 1
+    salto = 20 # Espaciado vertical entre líneas
+    
+    # Línea 1 (Color Rojo BGR: (0, 0, 255))
+    cv2.putText(canvas, titulo, (box_x1 + 10, box_y1 + 20),
+                fuente, escala, (0, 0, 255), grosor, cv2.LINE_AA)
+                
+    # Línea 2 (Color Verde BGR: (0, 255, 0))
+    cv2.putText(canvas, f"FPS: {fps:.1f} | Frames: {frames}", (box_x1 + 10, box_y1 + 20 + salto),
+                fuente, escala, (0, 255, 0), grosor, cv2.LINE_AA)
+                
+    # Línea 3 (Color Verde BGR: (0, 255, 0))
+    cv2.putText(canvas, f"Tiempo: {int(segundos)}s | {resolucion}", (box_x1 + 10, box_y1 + 20 + 2 * salto),
+                fuente, escala, (0, 255, 0), grosor, cv2.LINE_AA)
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # FUNCIÓN PRINCIPAL DEL EMISOR
 # ═══════════════════════════════════════════════════════════════════════════
 
 def iniciar_emisor(indice_camara=0, puerto=PUERTO_RTSP_DEFECTO, bitrate_kbps=2000):
     """
-    Función principal del emisor RTSP.
+    Función principal del emisor RTSP para Intel RealSense D435.
 
     Flujo de operación:
     1. Verifica que FFmpeg esté instalado
     2. Descarga/inicia MediaMTX (servidor RTSP)
-    3. Abre la cámara con OpenCV
+    3. Abre el pipeline de Intel RealSense D435
     4. Lanza FFmpeg para codificar H.264 y publicar en MediaMTX vía RTSP
-    5. Lee fotogramas de la cámara y los envía por stdin a FFmpeg
-    6. FFmpeg empaqueta los fotogramas en paquetes RTP y los envía al servidor
-
-    Protocolo de red involucrado:
-    ───────────────────────────
-    - RTSP (RFC 2326): señalización sobre TCP (puerto 8554)
-      → FFmpeg envía ANNOUNCE + SETUP + RECORD al servidor MediaMTX
-      → Los receptores envían DESCRIBE + SETUP + PLAY para recibir
-    - RTP (RFC 3550): transporte de paquetes de vídeo H.264 sobre UDP
-      → Cada fotograma H.264 se fragmenta en paquetes RTP de ~1400 bytes
-    - RTCP (RFC 3550): control de calidad (informes de recepción)
-      → Se intercambian periódicamente entre servidor y clientes
-
-    Args:
-        indice_camara: Índice del dispositivo de captura (0 = cámara por defecto)
-        puerto: Puerto TCP donde escuchará el servidor RTSP
-        bitrate_kbps: Tasa de bits para la codificación H.264 en kbps
+    5. Lee y procesa streams (RGB, IR 1, IR 2, Profundidad), compone el mosaico y lo envía a FFmpeg
+    6. FFmpeg codifica el mosaico final a H.264 y lo envía al servidor RTSP.
     """
     proceso_mediamtx = None
     proceso_ffmpeg = None
-    camara = None
+    pipeline = None
+    pipeline_started = False
 
     try:
         # ─── Paso 1: Verificar que FFmpeg esté disponible ──────────────
         print("\n" + "═" * 60)
-        print("  EMISOR RTSP — Transmisión de cámara local")
+        print("  EMISOR RTSP RealSense — Transmisión de Mosaico 4-Streams")
         print("═" * 60)
 
         print("\n[1/4] Verificando FFmpeg (vía imageio-ffmpeg) ...")
@@ -345,81 +389,78 @@ def iniciar_emisor(indice_camara=0, puerto=PUERTO_RTSP_DEFECTO, bitrate_kbps=200
         print(f"\n[2/4] Preparando servidor RTSP (MediaMTX) ...")
         proceso_mediamtx = iniciar_mediamtx(puerto)
 
-        # ─── Paso 3: Abrir la cámara con OpenCV ───────────────────────
-        print(f"\n[3/4] Abriendo cámara (índice {indice_camara}) ...")
-
-        # En Windows, usar DirectShow (CAP_DSHOW) para mejor compatibilidad
-        if platform.system() == "Windows":
-            camara = cv2.VideoCapture(indice_camara, cv2.CAP_DSHOW)
-        else:
-            camara = cv2.VideoCapture(indice_camara)
-
-        if not camara.isOpened():
-            print(f"  ✗ No se pudo abrir la cámara con índice {indice_camara}")
-            # Mostrar cámaras disponibles como ayuda
-            disponibles = listar_camaras()
-            if disponibles:
-                print(f"  Cámaras disponibles: {disponibles}")
-            else:
-                print("  No se detectaron cámaras conectadas.")
+        # ─── Paso 3: Abrir la cámara RealSense D435 y configurar Streams ───────────
+        print(f"\n[3/4] Abriendo dispositivo Intel RealSense ...")
+        
+        ctx = rs.context()
+        dispositivos = ctx.query_devices()
+        if len(dispositivos) == 0:
+            print("  ✗ No se detectaron cámaras Intel RealSense conectadas.")
             sys.exit(1)
+        
+        # Seleccionar dispositivo por índice
+        if indice_camara < len(dispositivos):
+            disp = dispositivos[indice_camara]
+        else:
+            disp = dispositivos[0]
+            print(f"  ⚠ Índice de cámara {indice_camara} no válido. Usando dispositivo por defecto (0).")
+            
+        nombre_disp = disp.get_info(rs.camera_info.name)
+        sn_disp = disp.get_info(rs.camera_info.serial_number)
+        print(f"  ✓ Dispositivo detectado: {nombre_disp} (S/N: {sn_disp})")
 
-        # Obtener las propiedades de la cámara para configurar FFmpeg
-        ancho = int(camara.get(cv2.CAP_PROP_FRAME_WIDTH))
-        alto = int(camara.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        fps = int(camara.get(cv2.CAP_PROP_FPS))
+        # Configurar streams con la máxima calidad y resolución nativa sin pérdida
+        pipeline = rs.pipeline()
+        config = rs.config()
+        config.enable_device(sn_disp)
 
-        # Algunas cámaras reportan 0 FPS; usar 30 como valor seguro
-        if fps <= 0 or fps > 120:
-            fps = 30
+        # RGB: 1920x1080 a 30fps en formato BGR8 (nativa OpenCV)
+        config.enable_stream(rs.stream.color, 1920, 1080, rs.format.bgr8, 30)
+        # Infrarrojo 1 (Izquierdo) e Infrarrojo 2 (Derecho): 1280x720 a 30fps (Y8 grayscale)
+        config.enable_stream(rs.stream.infrared, 1, 1280, 720, rs.format.y8, 30)
+        config.enable_stream(rs.stream.infrared, 2, 1280, 720, rs.format.y8, 30)
+        # Profundidad: 1280x720 a 30fps (Z16)
+        config.enable_stream(rs.stream.depth, 1280, 720, rs.format.z16, 30)
 
-        print(f"  ✓ Cámara abierta: {ancho}x{alto} @ {fps} FPS")
+        # Iniciar el pipeline
+        print("  → Iniciando pipeline de RealSense ...")
+        profile = pipeline.start(config)
+        pipeline_started = True
+        print("  ✓ Pipeline RealSense iniciado correctamente.")
+
+        # Dimensiones del lienzo final (Mosaico)
+        # Fila superior: RGB de 1920x1080
+        # Fila inferior: 3 columnas de 640x360 cada una (Ancho total = 1920, Alto = 360)
+        # Canvas completo = 1920 de ancho por 1440 de alto (1080 + 360)
+        ancho_canvas = 1920
+        alto_canvas = 1440
+        fps_stream = 30 # Forzado por hardware
 
         # ─── Paso 4: Lanzar FFmpeg para codificar y publicar RTSP ─────
         print(f"\n[4/4] Iniciando transmisión RTSP ...")
-
-        # URL RTSP donde FFmpeg publicará el flujo dentro de MediaMTX
-        # FFmpeg usa RTSP en modo "publicación" (ANNOUNCE + RECORD)
         url_rtsp = f"rtsp://127.0.0.1:{puerto}/{RUTA_FLUJO}"
 
-        # Comando FFmpeg:
-        # ─────────────────────────────────────────────────────────────
-        # -f rawvideo          → El formato de entrada es vídeo crudo (sin contenedor)
-        # -vcodec rawvideo     → El códec de entrada es datos crudos (sin comprimir)
-        # -pix_fmt bgr24       → Formato de píxeles BGR de 24 bits (formato nativo de OpenCV)
-        # -s {ancho}x{alto}    → Resolución del vídeo de entrada
-        # -r {fps}             → Tasa de fotogramas de entrada
-        # -i -                 → Leer la entrada desde stdin (pipe desde Python)
-        # -c:v libx264         → Codificar el vídeo con el códec H.264 (x264)
-        # -pix_fmt yuv420p     → Convertir a YUV 4:2:0 (requerido por H.264)
-        # -preset ultrafast    → Menor compresión pero mínima latencia
-        # -tune zerolatency    → Optimizar para streaming en tiempo real
-        # -b:v {bitrate}k      → Tasa de bits objetivo para el flujo de salida
-        # -g {fps*2}           → Intervalo de keyframes (GOP): cada 2 segundos
-        # -f rtsp              → Formato de salida: protocolo RTSP
-        # -rtsp_transport tcp  → Usar TCP para el transporte RTSP (más fiable en LAN)
-        # {url_rtsp}           → URL de destino en el servidor MediaMTX
+        # Comando FFmpeg configurado para el tamaño del mosaico (1920x1440)
         comando_ffmpeg = [
-            ruta_ffmpeg,                    # Ruta al binario de FFmpeg (vía imageio-ffmpeg)
-            "-y",                           # Sobrescribir sin preguntar
-            "-f", "rawvideo",               # Formato de entrada: vídeo crudo
-            "-vcodec", "rawvideo",          # Códec de entrada: sin compresión
-            "-pix_fmt", "bgr24",            # Píxeles en BGR24 (formato OpenCV)
-            "-s", f"{ancho}x{alto}",        # Resolución del frame de entrada
-            "-r", str(fps),                 # FPS de entrada
-            "-i", "-",                      # Entrada desde stdin (pipe)
-            "-c:v", "libx264",              # Codificador H.264 (x264)
-            "-pix_fmt", "yuv420p",          # Espacio de color de salida (YUV 4:2:0)
-            "-preset", "ultrafast",         # Preset de velocidad (mínima latencia)
-            "-tune", "zerolatency",         # Sintonizar para latencia cero
-            "-b:v", f"{bitrate_kbps}k",     # Bitrate de salida en kbps
-            "-g", str(fps * 2),             # Tamaño del GOP (Group of Pictures)
-            "-f", "rtsp",                   # Formato de salida: RTSP
-            "-rtsp_transport", "tcp",       # Transporte RTSP sobre TCP
-            url_rtsp                        # URL de destino RTSP
+            ruta_ffmpeg,
+            "-y",
+            "-f", "rawvideo",
+            "-vcodec", "rawvideo",
+            "-pix_fmt", "bgr24",
+            "-s", f"{ancho_canvas}x{alto_canvas}",
+            "-r", str(fps_stream),
+            "-i", "-",
+            "-c:v", "libx264",
+            "-pix_fmt", "yuv420p",
+            "-preset", "ultrafast",
+            "-tune", "zerolatency",
+            "-b:v", f"{bitrate_kbps}k",
+            "-g", str(fps_stream * 2),
+            "-f", "rtsp",
+            "-rtsp_transport", "tcp",
+            url_rtsp
         ]
 
-        # Iniciar el proceso FFmpeg con stdin como pipe para enviar fotogramas
         proceso_ffmpeg = subprocess.Popen(
             comando_ffmpeg,
             stdin=subprocess.PIPE,
@@ -428,85 +469,138 @@ def iniciar_emisor(indice_camara=0, puerto=PUERTO_RTSP_DEFECTO, bitrate_kbps=200
             creationflags=subprocess.CREATE_NO_WINDOW if platform.system() == "Windows" else 0
         )
 
-        # Esperar brevemente para que FFmpeg se conecte al servidor
         time.sleep(1)
 
-        # Verificar que FFmpeg siga corriendo
         if proceso_ffmpeg.poll() is not None:
             stderr_out = proceso_ffmpeg.stderr.read().decode(errors='replace')
             print(f"  ✗ FFmpeg terminó inesperadamente:")
             print(f"    {stderr_out[:500]}")
             sys.exit(1)
 
-        # Obtener la IP local para mostrar la URL completa
         ip_local = obtener_ip_local()
-
         print("  ✓ Transmisión RTSP activa")
         print("\n" + "═" * 60)
         print(f"  URL RTSP del flujo:")
         print(f"  → rtsp://{ip_local}:{puerto}/{RUTA_FLUJO}")
         print(f"")
+        print(f"  Resolución del Mosaico: {ancho_canvas}x{alto_canvas}")
         print(f"  Los receptores deben conectarse a esta URL.")
         print(f"  También puedes probar con VLC: Medio → Abrir ubicación de red")
         print("═" * 60)
         print("\n  Presiona Ctrl+C para detener la transmisión.\n")
 
-        # ─── Bucle principal: capturar y enviar fotogramas ─────────────
-        # Cada fotograma capturado por OpenCV se escribe como bytes crudos
-        # en el stdin de FFmpeg. FFmpeg los codifica en H.264, los empaqueta
-        # en paquetes RTP y los envía al servidor MediaMTX por RTSP/TCP.
+        # ─── Bucle principal: capturar, componer y enviar fotogramas ────
         fotogramas_enviados = 0
         tiempo_inicio = time.time()
 
         while True:
-            # Leer un fotograma de la cámara
-            ret, fotograma = camara.read()
+            # Esperar frames de RealSense
+            frames = pipeline.wait_for_frames()
 
-            if not ret:
-                # Si la lectura falla (cámara desconectada, etc.)
-                print("  ⚠ Error al leer de la cámara, reintentando...")
-                time.sleep(0.1)
+            color_frame = frames.get_color_frame()
+            ir_left_frame = frames.get_infrared_frame(1)
+            ir_right_frame = frames.get_infrared_frame(2)
+            depth_frame = frames.get_depth_frame()
+
+            if not color_frame or not ir_left_frame or not ir_right_frame or not depth_frame:
                 continue
 
+            # Convertir frames a numpy arrays
+            color_image = np.asanyarray(color_frame.get_data())      # 1920x1080 BGR
+            ir_left_image = np.asanyarray(ir_left_frame.get_data())    # 1280x720 Grayscale
+            ir_right_image = np.asanyarray(ir_right_frame.get_data())  # 1280x720 Grayscale
+            depth_image = np.asanyarray(depth_frame.get_data())        # 1280x720 Z16
+
+            # ─── 1. Procesamiento de Infrarrojos (Grayscale -> BGR) ───
+            ir_left_bgr = cv2.cvtColor(ir_left_image, cv2.COLOR_GRAY2BGR)
+            ir_right_bgr = cv2.cvtColor(ir_right_image, cv2.COLOR_GRAY2BGR)
+
+            # ─── 2. Procesamiento de Profundidad (Normalización y Heatmap JET) ───
+            # Rango límite de profundidad en milímetros (4.0m es ideal para D435)
+            max_depth_mm = 4000
+            depth_clipped = np.clip(depth_image, 0, max_depth_mm)
+            
+            # Normalizar a 8 bits (0-255)
+            depth_8bit = (depth_clipped * (255.0 / max_depth_mm)).astype(np.uint8)
+            
+            # Aplicar mapa de color JET (esquema térmico)
+            depth_heatmap = cv2.applyColorMap(depth_8bit, cv2.COLORMAP_JET)
+            
+            # Forzar píxeles sin profundidad válida (0 mm) a color negro para evitar ruido JET (azul)
+            depth_heatmap[depth_image == 0] = [0, 0, 0]
+
+            # ─── 3. Redimensionado proporcional para el Mosaico ───
+            # Redimensionar fila inferior a 1/3 del ancho total (1920 / 3 = 640px)
+            # Para mantener la proporción 16:9, el alto es 360px
+            ir_left_resized = cv2.resize(ir_left_bgr, (640, 360), interpolation=cv2.INTER_LINEAR)
+            depth_heatmap_resized = cv2.resize(depth_heatmap, (640, 360), interpolation=cv2.INTER_LINEAR)
+            ir_right_resized = cv2.resize(ir_right_bgr, (640, 360), interpolation=cv2.INTER_LINEAR)
+
+            # ─── 4. Composición de la Fila Inferior ───
+            bottom_row = np.hstack([ir_left_resized, depth_heatmap_resized, ir_right_resized])
+
+            # ─── 5. Composición del Lienzo Maestro ───
+            # Fila Superior (1920x1080) + Fila Inferior (1920x360) = 1920x1440
+            canvas = np.vstack([color_image, bottom_row])
+
+            # Calcular tiempos e información para etiquetas
+            tiempo_actual = time.time()
+            segundos_transcurridos = tiempo_actual - tiempo_inicio
+            
+            if segundos_transcurridos > 0:
+                fps_calculados = fotogramas_enviados / segundos_transcurridos
+            else:
+                fps_calculados = 0.0
+
+            # ─── 6. Dibujar las etiquetas OSD con rectángulos semitransparentes ───
+            # Fila Superior: RGB (1920x1080) -> Offset X: 0, Offset Y: 0
+            dibujar_hud_realsense(canvas, 0, 0, "Live | RGB", fps_calculados, fotogramas_enviados, segundos_transcurridos, "1920x1080")
+            
+            # Fila Inferior - Izquierda: Infrarojo 1 -> Offset X: 0, Offset Y: 1080
+            dibujar_hud_realsense(canvas, 0, 1080, "Live | Infrarojo 1", fps_calculados, fotogramas_enviados, segundos_transcurridos, "1280x720")
+            
+            # Fila Inferior - Centro: Profundidad -> Offset X: 640, Offset Y: 1080
+            dibujar_hud_realsense(canvas, 640, 1080, "Live | Profundidad", fps_calculados, fotogramas_enviados, segundos_transcurridos, "1280x720")
+            
+            # Fila Inferior - Derecha: Infrarojo 2 -> Offset X: 1280, Offset Y: 1080
+            dibujar_hud_realsense(canvas, 1280, 1080, "Live | Infrarojo 2", fps_calculados, fotogramas_enviados, segundos_transcurridos, "1280x720")
+
+            # Escribir frame crudo (descomprimido) en FFmpeg stdin
             try:
-                # Escribir los bytes crudos del fotograma en el stdin de FFmpeg
-                # El fotograma tiene formato BGR24 con shape (alto, ancho, 3)
-                # Total de bytes por fotograma = ancho × alto × 3
-                proceso_ffmpeg.stdin.write(fotograma.tobytes())
+                proceso_ffmpeg.stdin.write(canvas.tobytes())
                 fotogramas_enviados += 1
 
                 # Mostrar estadísticas cada 100 fotogramas
                 if fotogramas_enviados % 100 == 0:
-                    tiempo_transcurrido = time.time() - tiempo_inicio
-                    fps_real = fotogramas_enviados / tiempo_transcurrido
-                    print(f"  📹 Fotogramas enviados: {fotogramas_enviados} "
-                          f"| FPS real: {fps_real:.1f} "
-                          f"| Tiempo: {tiempo_transcurrido:.0f}s")
+                    print(f"  📹 Mosaicos enviados: {fotogramas_enviados} "
+                          f"| FPS promedio: {fps_calculados:.1f} "
+                          f"| Tiempo: {segundos_transcurridos:.0f}s")
 
             except BrokenPipeError:
-                # FFmpeg cerró su stdin — probablemente terminó
                 print("  ✗ FFmpeg cerró la conexión (BrokenPipe).")
                 break
             except OSError as e:
-                # Error del sistema operativo al escribir en el pipe
                 print(f"  ✗ Error de E/S con FFmpeg: {e}")
                 break
 
     except KeyboardInterrupt:
-        # El usuario presionó Ctrl+C para detener la transmisión
-        print("\n\n  ⏹ Emisor detenido por el usuario (Ctrl+C).")
+        print("\n\n  ⏹ Emisor RealSense detenido por el usuario (Ctrl+C).")
 
     except Exception as e:
-        # Cualquier otra excepción no prevista
-        print(f"\n  ✗ Error inesperado: {e}")
+        print(f"\n  ✗ Error inesperado en el emisor RealSense: {e}")
 
     finally:
-        # ─── Limpieza de recursos ──────────────────────────────────────
-        # Es fundamental cerrar todos los procesos y liberar la cámara
-        # para evitar procesos huérfanos y bloqueos de hardware.
         print("\n  Liberando recursos ...")
 
-        # Cerrar el pipe de stdin de FFmpeg para señalar fin de datos
+        # Detener el pipeline de RealSense
+        if pipeline_started and pipeline is not None:
+            try:
+                pipeline.stop()
+                print("  ✓ Pipeline RealSense detenido")
+            except Exception as e:
+                print(f"  ✗ Error al detener el pipeline RealSense: {e}")
+
+        # Cerrar el pipe de stdin de FFmpeg
         if proceso_ffmpeg and proceso_ffmpeg.stdin:
             try:
                 proceso_ffmpeg.stdin.close()
@@ -522,11 +616,6 @@ def iniciar_emisor(indice_camara=0, puerto=PUERTO_RTSP_DEFECTO, bitrate_kbps=200
             except Exception:
                 proceso_ffmpeg.kill()
                 print("  ✓ FFmpeg forzado a detener")
-
-        # Liberar la cámara
-        if camara and camara.isOpened():
-            camara.release()
-            print("  ✓ Cámara liberada")
 
         # Detener el servidor MediaMTX
         if proceso_mediamtx and proceso_mediamtx.poll() is None:
