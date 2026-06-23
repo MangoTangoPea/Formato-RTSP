@@ -295,74 +295,38 @@ def obtener_ip_local():
         return "127.0.0.1"
 
 
-def dibujar_hud_rgb(canvas, titulo, fps, frames, segundos, resolucion):
+def crear_proceso_ffmpeg(ruta_ffmpeg, url_stream, ancho, alto, pix_fmt, fps, bitrate_kbps):
     """
-    HUD para la sección RGB superior — posicionado en la ESQUINA INFERIOR DERECHA
-    del área RGB (0,0)→(1920,1080) para no conflictuar con el OSD original
-    quemado por la cámara en la esquina superior izquierda.
-
-    Usa fuente estándar ya que la resolución nativa 1920x1080 no sufre
-    degradación por redimensionamiento.
+    Lanza un subproceso de FFmpeg optimizado para codificar un stream rawvideo
+    y publicarlo vía RTSP.
     """
-    box_ancho = 340
-    box_alto = 80
-    box_x2 = 1920 - 10
-    box_y2 = 1080 - 10
-    box_x1 = box_x2 - box_ancho
-    box_y1 = box_y2 - box_alto
-
-    overlay = canvas.copy()
-    cv2.rectangle(overlay, (box_x1, box_y1), (box_x2, box_y2), (40, 40, 40), -1)
-    cv2.addWeighted(overlay, 0.6, canvas, 0.4, 0, canvas)
-
-    fuente = cv2.FONT_HERSHEY_SIMPLEX
-    escala = 0.5
-    grosor = 1
-    salto = 22
-
-    # Línea 1 (Rojo en BGR)
-    cv2.putText(canvas, titulo, (box_x1 + 10, box_y1 + 22),
-                fuente, escala, (0, 0, 255), grosor, cv2.LINE_AA)
-    # Línea 2 (Verde en BGR)
-    cv2.putText(canvas, f"FPS: {fps:.1f} | Frames: {frames}", (box_x1 + 10, box_y1 + 22 + salto),
-                fuente, escala, (0, 255, 0), grosor, cv2.LINE_AA)
-    # Línea 3 (Verde en BGR)
-    cv2.putText(canvas, f"Tiempo: {int(segundos)}s | {resolucion}", (box_x1 + 10, box_y1 + 22 + 2 * salto),
-                fuente, escala, (0, 255, 0), grosor, cv2.LINE_AA)
-
-
-def dibujar_hud_inferior(canvas, x_offset, y_offset, titulo, fps, frames, segundos, resolucion):
-    """
-    HUD para las secciones inferiores (IR1, Depth, IR2) — posicionado en la
-    ESQUINA SUPERIOR IZQUIERDA de cada panel.
-
-    Usa fuente TRIPLICADA (fontScale=1.1, thickness=3) para compensar la
-    reducción de resolución de 1280x720 → 640x360 y garantizar legibilidad
-    después de la codificación H.264 y la decodificación en el receptor.
-    """
-    box_x1 = x_offset + 8
-    box_y1 = y_offset + 8
-    box_x2 = x_offset + 520
-    box_y2 = y_offset + 130
-
-    overlay = canvas.copy()
-    cv2.rectangle(overlay, (box_x1, box_y1), (box_x2, box_y2), (40, 40, 40), -1)
-    cv2.addWeighted(overlay, 0.6, canvas, 0.4, 0, canvas)
-
-    fuente = cv2.FONT_HERSHEY_SIMPLEX
-    escala = 1.1     # Triplicado desde 0.45 para legibilidad post-resize
-    grosor = 3       # Triplicado desde 1 para legibilidad post-resize
-    salto = 36       # Espaciado proporcional al tamaño de fuente
-
-    # Línea 1 (Rojo en BGR)
-    cv2.putText(canvas, titulo, (box_x1 + 10, box_y1 + 30),
-                fuente, escala, (0, 0, 255), grosor, cv2.LINE_AA)
-    # Línea 2 (Verde en BGR)
-    cv2.putText(canvas, f"FPS: {fps:.1f} | Frames: {frames}", (box_x1 + 10, box_y1 + 30 + salto),
-                fuente, escala, (0, 255, 0), grosor, cv2.LINE_AA)
-    # Línea 3 (Verde en BGR)
-    cv2.putText(canvas, f"Tiempo: {int(segundos)}s | {resolucion}", (box_x1 + 10, box_y1 + 30 + 2 * salto),
-                fuente, escala, (0, 255, 0), grosor, cv2.LINE_AA)
+    comando = [
+        ruta_ffmpeg,
+        "-y",
+        "-f", "rawvideo",
+        "-vcodec", "rawvideo",
+        "-pix_fmt", pix_fmt,
+        "-s", f"{ancho}x{alto}",
+        "-r", str(fps),
+        "-i", "-",
+        "-c:v", "libx264",
+        "-pix_fmt", "yuv420p",
+        "-preset", "ultrafast",
+        "-tune", "zerolatency",
+        "-x264-params", "sliced-threads=1:rc-lookahead=0",
+        "-b:v", f"{bitrate_kbps}k",
+        "-g", str(fps * 2),
+        "-f", "rtsp",
+        "-rtsp_transport", "tcp",
+        url_stream
+    ]
+    return subprocess.Popen(
+        comando,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        creationflags=subprocess.CREATE_NO_WINDOW if platform.system() == "Windows" else 0
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -372,16 +336,20 @@ def dibujar_hud_inferior(canvas, x_offset, y_offset, titulo, fps, frames, segund
 def iniciar_emisor(indice_camara=0, puerto=PUERTO_RTSP_DEFECTO, bitrate_kbps=2000):
     """
     Función principal del emisor RTSP para Intel RealSense D435.
+    Captura 4 streams y los publica de forma independiente.
     """
     proceso_mediamtx = None
-    proceso_ffmpeg = None
+    proceso_color = None
+    proceso_depth = None
+    proceso_ir1 = None
+    proceso_ir2 = None
     pipeline = None
     pipeline_started = False
 
     try:
         # ─── Paso 1: Verificar que FFmpeg esté disponible ──────────────
         print("\n" + "═" * 60)
-        print("  EMISOR RTSP RealSense — Transmisión de Mosaico 4-Streams")
+        print("  EMISOR RTSP RealSense — Transmisión Multicanal (4 Streams)")
         print("═" * 60)
 
         print("\n[1/4] Verificando FFmpeg (vía imageio-ffmpeg) ...")
@@ -426,78 +394,64 @@ def iniciar_emisor(indice_camara=0, puerto=PUERTO_RTSP_DEFECTO, bitrate_kbps=200
             print("    Asegúrate de que la cámara esté conectada por USB 3.0.")
             sys.exit(1)
 
-        # Dimensiones del lienzo final (Mosaico)
-        ancho_canvas = 1920
-        alto_canvas = 1440
         fps_stream = 30 # Forzado por hardware
 
-        # ─── Paso 4: Lanzar FFmpeg para codificar y publicar RTSP ─────
-        print(f"\n[4/4] Iniciando transmisión RTSP ...")
-        url_rtsp = f"rtsp://127.0.0.1:{puerto}/{RUTA_FLUJO}"
+        # ─── Paso 4: Lanzar FFmpeg para codificar y publicar los 4 Streams ─────
+        print(f"\n[4/4] Iniciando transmisión RTSP de 4 canales ...")
+        
+        # Repartir el bitrate especificado entre los flujos
+        bitrate_color = max(100, int(bitrate_kbps * 0.6))
+        bitrate_depth = max(100, int(bitrate_kbps * 0.2))
+        bitrate_ir1 = max(100, int(bitrate_kbps * 0.1))
+        bitrate_ir2 = max(100, int(bitrate_kbps * 0.1))
 
-        # Comando FFmpeg optimizado para mínima latencia en software
-        # - ultrafast + zerolatency: mínimo cómputo de codificación
-        # - sliced-threads: paraleliza la codificación por franjas del frame
-        # - rc-lookahead=0: desactiva el lookahead del rate-control (elimina
-        #   frames de buffer interno que introducen latencia)
-        comando_ffmpeg = [
-            ruta_ffmpeg,
-            "-y",
-            "-f", "rawvideo",
-            "-vcodec", "rawvideo",
-            "-pix_fmt", "bgr24",
-            "-s", f"{ancho_canvas}x{alto_canvas}",
-            "-r", str(fps_stream),
-            "-i", "-",
-            "-c:v", "libx264",
-            "-pix_fmt", "yuv420p",
-            "-preset", "ultrafast",
-            "-tune", "zerolatency",
-            "-x264-params", "sliced-threads=1:rc-lookahead=0",
-            "-b:v", f"{bitrate_kbps}k",
-            "-g", str(fps_stream * 2),
-            "-f", "rtsp",
-            "-rtsp_transport", "tcp",
-            url_rtsp
-        ]
+        url_color = f"rtsp://127.0.0.1:{puerto}/color"
+        url_depth = f"rtsp://127.0.0.1:{puerto}/depth"
+        url_ir1 = f"rtsp://127.0.0.1:{puerto}/ir1"
+        url_ir2 = f"rtsp://127.0.0.1:{puerto}/ir2"
 
-        proceso_ffmpeg = subprocess.Popen(
-            comando_ffmpeg,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            creationflags=subprocess.CREATE_NO_WINDOW if platform.system() == "Windows" else 0
-        )
+        print(f"  → Iniciando canal Color (RGB 1920x1080) -> {url_color}")
+        proceso_color = crear_proceso_ffmpeg(ruta_ffmpeg, url_color, 1920, 1080, "bgr24", fps_stream, bitrate_color)
+        
+        print(f"  → Iniciando canal Profundidad (Depth JET 1280x720) -> {url_depth}")
+        proceso_depth = crear_proceso_ffmpeg(ruta_ffmpeg, url_depth, 1280, 720, "bgr24", fps_stream, bitrate_depth)
+
+        print(f"  → Iniciando canal Infrarrojo 1 (IR1 Gray 1280x720) -> {url_ir1}")
+        proceso_ir1 = crear_proceso_ffmpeg(ruta_ffmpeg, url_ir1, 1280, 720, "gray", fps_stream, bitrate_ir1)
+
+        print(f"  → Iniciando canal Infrarrojo 2 (IR2 Gray 1280x720) -> {url_ir2}")
+        proceso_ir2 = crear_proceso_ffmpeg(ruta_ffmpeg, url_ir2, 1280, 720, "gray", fps_stream, bitrate_ir2)
 
         time.sleep(1)
 
-        if proceso_ffmpeg.poll() is not None:
-            stderr_out = proceso_ffmpeg.stderr.read().decode(errors='replace')
-            print(f"  ✗ FFmpeg terminó inesperadamente:")
-            print(f"    {stderr_out[:500]}")
-            sys.exit(1)
+        # Verificar que todos los FFmpeg se hayan iniciado correctamente
+        procesos_ffmpeg = [
+            (proceso_color, "color"),
+            (proceso_depth, "depth"),
+            (proceso_ir1, "ir1"),
+            (proceso_ir2, "ir2")
+        ]
+        for proc, name in procesos_ffmpeg:
+            if proc.poll() is not None:
+                stderr_out = proc.stderr.read().decode(errors='replace')
+                print(f"  ✗ FFmpeg ({name}) terminó inesperadamente:")
+                print(f"    {stderr_out[:300]}")
+                sys.exit(1)
 
         ip_local = obtener_ip_local()
-        print("  ✓ Transmisión RTSP activa")
+        print("  ✓ Transmisión RTSP activa para los 4 canales")
         print("\n" + "═" * 60)
-        print(f"  URL RTSP del flujo:")
-        print(f"  → rtsp://{ip_local}:{puerto}/{RUTA_FLUJO}")
-        print(f"")
-        print(f"  Resolución del Mosaico: {ancho_canvas}x{alto_canvas}")
-        print(f"  Los receptores deben conectarse a esta URL.")
-        print(f"  También puedes probar con VLC: Medio → Abrir ubicación de red")
+        print(f"  URLs RTSP de los flujos:")
+        print(f"  → Color (RGB):   rtsp://{ip_local}:{puerto}/color")
+        print(f"  → Depth Map:     rtsp://{ip_local}:{puerto}/depth")
+        print(f"  → Infrared 1:    rtsp://{ip_local}:{puerto}/ir1")
+        print(f"  → Infrared 2:    rtsp://{ip_local}:{puerto}/ir2")
         print("═" * 60)
         print("\n  Presiona Ctrl+C para detener la transmisión.\n")
 
-        # ─── Bucle principal: capturar, componer y enviar fotogramas ────
+        # ─── Bucle principal: capturar, procesar y enviar fotogramas ────
         fotogramas_enviados = 0
         tiempo_inicio = time.time()
-
-        # Cálculo de FPS optimizado: se actualiza cada N frames para no
-        # sobrecargar el bucle principal con divisiones en cada iteración
-        FPS_INTERVALO = 30
-        fps_calculados = 0.0
-        fps_ultimo_tiempo = time.time()
 
         while True:
             # Esperar un conjunto sincronizado de fotogramas (RGB + Depth + IR) con timeout
@@ -516,16 +470,12 @@ def iniciar_emisor(indice_camara=0, puerto=PUERTO_RTSP_DEFECTO, bitrate_kbps=200
                 continue
 
             # Convertir frames a numpy arrays
-            color_image = np.asanyarray(color_frame.get_data())      # 1920x1080 BGR
-            ir_left_image = np.asanyarray(ir_left_frame.get_data())    # 1280x720 Grayscale
-            ir_right_image = np.asanyarray(ir_right_frame.get_data())  # 1280x720 Grayscale
-            depth_image = np.asanyarray(depth_frame.get_data())        # 1280x720 Z16
+            color_image = np.asanyarray(color_frame.get_data())        # 1920x1080 BGR
+            ir_left_image = np.asanyarray(ir_left_frame.get_data())      # 1280x720 Grayscale
+            ir_right_image = np.asanyarray(ir_right_frame.get_data())    # 1280x720 Grayscale
+            depth_image = np.asanyarray(depth_frame.get_data())          # 1280x720 Z16
 
-            # ─── 1. Procesamiento de Infrarrojos (Grayscale -> BGR) ───
-            ir_left_bgr = cv2.cvtColor(ir_left_image, cv2.COLOR_GRAY2BGR)
-            ir_right_bgr = cv2.cvtColor(ir_right_image, cv2.COLOR_GRAY2BGR)
-
-            # ─── 2. Procesamiento de Profundidad (Normalización y Heatmap JET) ───
+            # ─── Procesamiento de Profundidad (Normalización y Heatmap JET) ───
             max_depth_mm = 4000
             depth_clipped = np.clip(depth_image, 0, max_depth_mm)
 
@@ -538,49 +488,21 @@ def iniciar_emisor(indice_camara=0, puerto=PUERTO_RTSP_DEFECTO, bitrate_kbps=200
             # Forzar píxeles sin profundidad válida (0 mm) a color negro
             depth_heatmap[depth_image == 0] = [0, 0, 0]
 
-            # ─── 3. Redimensionado con LANCZOS4 (máxima calidad) ───
-            # INTER_LANCZOS4 usa un kernel de 8x8 píxeles para la
-            # interpolación, produciendo la imagen más nítida posible
-            # al reducir de 1280x720 → 640x360
-            ir_left_resized = cv2.resize(ir_left_bgr, (640, 360), interpolation=cv2.INTER_LANCZOS4)
-            depth_heatmap_resized = cv2.resize(depth_heatmap, (640, 360), interpolation=cv2.INTER_LANCZOS4)
-            ir_right_resized = cv2.resize(ir_right_bgr, (640, 360), interpolation=cv2.INTER_LANCZOS4)
-
-            # ─── 4. Composición de la Fila Inferior ───
-            bottom_row = np.hstack([ir_left_resized, depth_heatmap_resized, ir_right_resized])
-
-            # ─── 5. Composición del Lienzo Maestro ───
-            canvas = np.vstack([color_image, bottom_row])
-
-            # ─── 6. Cálculo de FPS optimizado (cada 30 frames) ───
-            # Evita sobrecargar el bucle con divisiones en cada iteración
-            fotogramas_enviados += 1
-            if fotogramas_enviados % FPS_INTERVALO == 0:
-                ahora = time.time()
-                delta = ahora - fps_ultimo_tiempo
-                if delta > 0:
-                    fps_calculados = FPS_INTERVALO / delta
-                fps_ultimo_tiempo = ahora
-
-            segundos_transcurridos = time.time() - tiempo_inicio
-
-            # ─── 7. Dibujar OSD ───
-            # RGB: esquina INFERIOR DERECHA (evita conflicto con OSD quemado)
-            dibujar_hud_rgb(canvas, "Live | RGB", fps_calculados, fotogramas_enviados, segundos_transcurridos, "1920x1080")
-
-            # Paneles inferiores: esquina SUPERIOR IZQUIERDA, fuentes GRANDES
-            dibujar_hud_inferior(canvas, 0, 1080, "IR1", fps_calculados, fotogramas_enviados, segundos_transcurridos, "1280x720")
-            dibujar_hud_inferior(canvas, 640, 1080, "Profundidad", fps_calculados, fotogramas_enviados, segundos_transcurridos, "1280x720")
-            dibujar_hud_inferior(canvas, 1280, 1080, "IR2", fps_calculados, fotogramas_enviados, segundos_transcurridos, "1280x720")
-
-            # Escribir frame crudo (descomprimido) en FFmpeg stdin
+            # Escribir frames crudos en los stdin de sus respectivos procesos FFmpeg
             try:
-                proceso_ffmpeg.stdin.write(canvas.tobytes())
+                proceso_color.stdin.write(color_image.tobytes())
+                proceso_depth.stdin.write(depth_heatmap.tobytes())
+                proceso_ir1.stdin.write(ir_left_image.tobytes())
+                proceso_ir2.stdin.write(ir_right_image.tobytes())
+
+                fotogramas_enviados += 1
 
                 # Mostrar estadísticas cada 100 fotogramas
                 if fotogramas_enviados % 100 == 0:
-                    print(f"  📹 Mosaicos enviados: {fotogramas_enviados} "
-                          f"| FPS: {fps_calculados:.1f} "
+                    segundos_transcurridos = time.time() - tiempo_inicio
+                    fps_actual = fotogramas_enviados / segundos_transcurridos if segundos_transcurridos > 0 else 0.0
+                    print(f"  📹 Fotogramas enviados: {fotogramas_enviados} "
+                          f"| FPS Promedio: {fps_actual:.1f} "
                           f"| Tiempo: {segundos_transcurridos:.0f}s")
 
             except BrokenPipeError:
@@ -588,6 +510,14 @@ def iniciar_emisor(indice_camara=0, puerto=PUERTO_RTSP_DEFECTO, bitrate_kbps=200
                 break
             except OSError as e:
                 print(f"  ✗ Error de E/S con FFmpeg: {e}")
+                break
+
+            # Verificar si algún FFmpeg terminó de forma inesperada
+            if (proceso_color.poll() is not None or
+                proceso_depth.poll() is not None or
+                proceso_ir1.poll() is not None or
+                proceso_ir2.poll() is not None):
+                print("  ✗ Uno de los procesos de FFmpeg se detuvo.")
                 break
 
     except KeyboardInterrupt:
@@ -607,22 +537,24 @@ def iniciar_emisor(indice_camara=0, puerto=PUERTO_RTSP_DEFECTO, bitrate_kbps=200
             except Exception as e:
                 print(f"  ✗ Error al detener el pipeline RealSense: {e}")
 
-        # Cerrar el pipe de stdin de FFmpeg
-        if proceso_ffmpeg and proceso_ffmpeg.stdin:
-            try:
-                proceso_ffmpeg.stdin.close()
-            except Exception:
-                pass
+        # Cerrar stdin de todos los FFmpeg
+        for proc, name in [(proceso_color, "color"), (proceso_depth, "depth"), (proceso_ir1, "ir1"), (proceso_ir2, "ir2")]:
+            if proc and proc.stdin:
+                try:
+                    proc.stdin.close()
+                except Exception:
+                    pass
 
-        # Terminar el proceso FFmpeg
-        if proceso_ffmpeg and proceso_ffmpeg.poll() is None:
-            try:
-                proceso_ffmpeg.terminate()
-                proceso_ffmpeg.wait(timeout=5)
-                print("  ✓ FFmpeg detenido")
-            except Exception:
-                proceso_ffmpeg.kill()
-                print("  ✓ FFmpeg forzado a detener")
+        # Terminar procesos FFmpeg
+        for proc, name in [(proceso_color, "color"), (proceso_depth, "depth"), (proceso_ir1, "ir1"), (proceso_ir2, "ir2")]:
+            if proc and proc.poll() is None:
+                try:
+                    proc.terminate()
+                    proc.wait(timeout=2)
+                    print(f"  ✓ FFmpeg ({name}) detenido")
+                except Exception:
+                    proc.kill()
+                    print(f"  ✓ FFmpeg ({name}) forzado a detener")
 
         # Detener el servidor MediaMTX
         if proceso_mediamtx and proceso_mediamtx.poll() is None:
