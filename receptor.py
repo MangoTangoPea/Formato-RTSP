@@ -433,19 +433,30 @@ Notas:
 
     args = parser.parse_args()
 
-    # Determinar la URL RTSP a partir de los argumentos
-    if args.destino is None:
-        # Sin argumentos: usar localhost por defecto
-        url = construir_url_rtsp("127.0.0.1", PUERTO_RTSP_DEFECTO)
-        print(f"  Sin argumentos. Usando URL por defecto: {url}")
-        print(f"  Uso: python receptor.py <IP_EMISOR> [PUERTO]")
-        print(f"       python receptor.py rtsp://IP:PUERTO/camara\n")
-    elif args.destino.startswith("rtsp://"):
-        # Se proporcionó una URL RTSP completa
-        url = args.destino
-    else:
-        # Se proporcionó solo la IP (y opcionalmente el puerto)
-        url = construir_url_rtsp(args.destino, args.puerto)
+    # Resolver IP de destino a partir de los argumentos
+    ip_destino = "127.0.0.1"
+    puerto_destino = args.puerto
+
+    if args.destino is not None:
+        if args.destino.startswith("rtsp://"):
+            # Extraer IP y puerto de la URL completa rtsp://IP:puerto/ruta
+            sin_protocolo = args.destino[7:]
+            if "/" in sin_protocolo:
+                host_puerto = sin_protocolo.split("/")[0]
+            else:
+                host_puerto = sin_protocolo
+                
+            if ":" in host_puerto:
+                parts = host_puerto.split(":")
+                ip_destino = parts[0]
+                try:
+                    puerto_destino = int(parts[1])
+                except ValueError:
+                    pass
+            else:
+                ip_destino = host_puerto
+        else:
+            ip_destino = args.destino
 
     # Iniciar el receptor
-    iniciar_receptor(url, mostrar_hud_info=not args.sin_hud)
+    iniciar_receptor(ip_destino, puerto_destino, mostrar_hud_info=not args.sin_hud)
