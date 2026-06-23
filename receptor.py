@@ -189,7 +189,8 @@ def mostrar_info_flujo(captura):
 def dibujar_hud(fotograma, fps_actual, fotogramas_recibidos, tiempo_transcurrido):
     """
     Dibuja un HUD (Head-Up Display) compacto con información de estado
-    sobre la esquina superior izquierda del fotograma recibido.
+    en la esquina inferior derecha del lienzo para evitar conflictos
+    con los OSDs del emisor y el OSD nativo de la cámara RGB.
 
     A diferencia del emisor (que dibuja HUD sobre cada panel del mosaico),
     el receptor solo añade una barra de estado general para no duplicar
@@ -203,9 +204,22 @@ def dibujar_hud(fotograma, fps_actual, fotogramas_recibidos, tiempo_transcurrido
 
     Retorna el fotograma con el HUD dibujado.
     """
+    alto, ancho = fotograma.shape[:2]
+    
+    # Dimensiones de la barra de estado general
+    box_ancho = 380
+    box_alto = 80
+    
+    # Colocar en la esquina inferior derecha del mosaico (dentro del panel IR2)
+    # dejando libre la esquina superior izquierda de cada panel.
+    box_x2 = ancho - 10
+    box_y2 = alto - 10
+    box_x1 = box_x2 - box_ancho
+    box_y1 = box_y2 - box_alto
+
     # ─── Fondo semitransparente para la barra de estado ───────────────
     overlay = fotograma.copy()
-    cv2.rectangle(overlay, (5, 5), (380, 80), (0, 0, 0), -1)
+    cv2.rectangle(overlay, (box_x1, box_y1), (box_x2, box_y2), (0, 0, 0), -1)
     cv2.addWeighted(overlay, 0.5, fotograma, 0.5, 0, fotograma)
 
     fuente = cv2.FONT_HERSHEY_SIMPLEX
@@ -214,15 +228,15 @@ def dibujar_hud(fotograma, fps_actual, fotogramas_recibidos, tiempo_transcurrido
 
     # Línea 1: Título
     cv2.putText(fotograma, "RECEPTOR RTSP — Mosaico RealSense D435",
-                (10, 25), fuente, 0.5, color_titulo, 1, cv2.LINE_AA)
+                (box_x1 + 10, box_y1 + 25), fuente, 0.5, color_titulo, 1, cv2.LINE_AA)
 
     # Línea 2: FPS y contador de frames
     cv2.putText(fotograma, f"FPS: {fps_actual:.1f} | Frames: {fotogramas_recibidos}",
-                (10, 50), fuente, 0.45, color_datos, 1, cv2.LINE_AA)
+                (box_x1 + 10, box_y1 + 50), fuente, 0.45, color_datos, 1, cv2.LINE_AA)
 
     # Línea 3: Tiempo transcurrido
     cv2.putText(fotograma, f"Tiempo: {tiempo_transcurrido:.0f}s | Presiona 'q' para salir",
-                (10, 70), fuente, 0.45, color_datos, 1, cv2.LINE_AA)
+                (box_x1 + 10, box_y1 + 70), fuente, 0.45, color_datos, 1, cv2.LINE_AA)
 
     return fotograma
 
@@ -328,6 +342,12 @@ def iniciar_receptor(url_rtsp, mostrar_hud_info=True):
             tiempo_inicio = time.time()
             fotogramas_fallidos = 0
 
+            # Cálculo de FPS optimizado: se actualiza cada N frames para no
+            # sobrecargar el bucle de recepción con cálculos en cada fotograma.
+            FPS_INTERVALO = 30
+            fps_actual = 0.0
+            fps_ultimo_tiempo = time.time()
+
             # ─── Bucle de recepción de fotogramas ──────────────────────
             # cv2.VideoCapture.read() internamente:
             #   1. Lee paquetes RTP del buffer de red
@@ -355,12 +375,15 @@ def iniciar_receptor(url_rtsp, mostrar_hud_info=True):
                 fotogramas_fallidos = 0
                 fotogramas_recibidos += 1
 
-                # Calcular FPS en tiempo real
+                # Calcular FPS optimizado (cada 30 frames)
+                if fotogramas_recibidos % FPS_INTERVALO == 0:
+                    ahora = time.time()
+                    delta = ahora - fps_ultimo_tiempo
+                    if delta > 0:
+                        fps_actual = FPS_INTERVALO / delta
+                    fps_ultimo_tiempo = ahora
+
                 tiempo_transcurrido = time.time() - tiempo_inicio
-                if tiempo_transcurrido > 0:
-                    fps_actual = fotogramas_recibidos / tiempo_transcurrido
-                else:
-                    fps_actual = 0.0
 
                 # Dibujar información de estado (HUD) si está habilitado
                 if mostrar_hud_info:
