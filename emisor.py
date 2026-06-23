@@ -1,30 +1,50 @@
 #!/usr/bin/env python3
 """
-Emisor RTSP: captura vídeo de la cámara local y lo publica como flujo RTSP
-mediante FFmpeg + MediaMTX.
+Emisor RTSP para Intel RealSense D435.
 
-Arquitectura del protocolo RTSP (Real Time Streaming Protocol):
-───────────────────────────────────────────────────────────────
-  ┌──────────┐   raw frames    ┌─────────┐   RTSP/RTP    ┌──────────┐
-  │  Cámara  │ ──────────────► │ FFmpeg  │ ────────────► │ MediaMTX │
-  │ (OpenCV) │   vía stdin     │ (H.264) │  push RTSP    │ (server) │
-  └──────────┘                 └─────────┘               └──────────┘
-                                                              │
-                                                    rtsp://<IP>:8554/camara
-                                                              │
-                                                         ┌────▼─────┐
-                                                         │ Receptor │
-                                                         └──────────┘
+Captura los flujos de Color (RGB), Infrarrojo 1 (Left), Infrarrojo 2 (Right) 
+y Profundidad (Depth) usando el SDK oficial de Intel (pyrealsense2). Compone 
+un lienzo maestro en forma de mosaico de 4 vistas (1920x1440), aplica un mapa 
+de calor a la profundidad, añade HUDs de estado en tiempo real (OSD) y lo 
+transmite vía RTSP H.264 usando FFmpeg y el servidor local MediaMTX.
 
-RTSP usa TCP para la señalización (DESCRIBE, SETUP, PLAY, TEARDOWN)
-y RTP sobre UDP (o TCP entrelazado) para el transporte de los paquetes
-de vídeo codificados en H.264.
+Arquitectura del sistema:
+─────────────────────────
+  ┌────────────────┐  RGB, Depth, IR1, IR2  ┌────────────┐  raw frame   ┌─────────┐
+  │  Intel D435    │ ─────────────────────► │ Composición│ ───────────► │ FFmpeg  │
+  │ (pyrealsense2) │  via SDK               │ Mosaico 4ch│  vía stdin   │ (H.264) │
+  └────────────────┘                        └────────────┘              └────┬────┘
+                                                                            │
+                                                                      RTSP/RTP push
+                                                                            │
+                                                                      ┌─────▼──────┐
+                                                                      │  MediaMTX  │
+                                                                      │  (server)  │
+                                                                      └─────┬──────┘
+                                                                            │
+                                                                  rtsp://<IP>:8554/camara
+                                                                            │
+                                                                       ┌────▼─────┐
+                                                                       │ Receptor │
+                                                                       └──────────┘
+
+Mosaico de Salida (1920x1440):
+  ┌──────────────────────────────────────────────────────────┐
+  │                                                          │
+  │                   Color (RGB)                            │
+  │                   1920 x 1080                            │
+  │                                                          │
+  ├──────────────────┬───────────────────┬───────────────────┤
+  │    Infrared 1    │   Depth Heatmap   │    Infrared 2     │
+  │    640 x 360     │     640 x 360     │     640 x 360     │
+  └──────────────────┴───────────────────┴───────────────────┘
 
 Uso:
     python emisor.py [--puerto PUERTO] [--cam INDICE] [--calidad BITRATE_KBPS]
+    python emisor.py --listar-camaras
 
 Ejemplo:
-    python emisor.py --puerto 8554 --cam 0 --calidad 2000
+    python emisor.py --puerto 8554 --cam 0 --calidad 4000
 """
 
 import subprocess
@@ -64,6 +84,14 @@ except ImportError:
     print("  Instálalo con:  pip install -r requirements.txt")
     sys.exit(1)
 
+# ─── Intentar importar pyrealsense2 ───────────────────────────────────────
+try:
+    import pyrealsense2 as rs
+except ImportError:
+    print("Error: pyrealsense2 no está instalado.")
+    print("  Instálalo con:  pip install -r requirements.txt")
+    sys.exit(1)
+
 # ─── Intentar importar imageio_ffmpeg ─────────────────────────────────────
 # Este paquete incluye un binario estático de FFmpeg que se instala vía pip,
 # eliminando la necesidad de instalar FFmpeg manualmente en el sistema.
@@ -71,14 +99,6 @@ try:
     import imageio_ffmpeg
 except ImportError:
     print("Error: imageio-ffmpeg no está instalado.")
-    print("  Instálalo con:  pip install -r requirements.txt")
-    sys.exit(1)
-
-# ─── Intentar importar pyrealsense2 ───────────────────────────────────────
-try:
-    import pyrealsense2 as rs
-except ImportError:
-    print("Error: pyrealsense2 no está instalado.")
     print("  Instálalo con:  pip install -r requirements.txt")
     sys.exit(1)
 
@@ -112,22 +132,10 @@ MEDIAMTX_URL = (
 def obtener_ruta_ffmpeg():
     """
     Obtiene la ruta al ejecutable de FFmpeg usando imageio-ffmpeg.
-    Este paquete instala un binario estático de FFmpeg dentro del entorno
-    virtual de Python, por lo que no es necesario instalar FFmpeg
-    manualmente en el sistema operativo.
-
-    imageio_ffmpeg.get_ffmpeg_exe() busca FFmpeg en este orden:
-      1. Variable de entorno IMAGEIO_FFMPEG_EXE (si está definida)
-      2. Binario incluido en el paquete imageio-ffmpeg (instalado vía pip)
-      3. Instalación del sistema (PATH) como respaldo
-
-    Retorna la ruta completa al ejecutable de FFmpeg, o None si no se encuentra.
+    Retorna la ruta completa al ejecutable, o None si no se encuentra.
     """
     try:
-        # Obtener la ruta al binario de FFmpeg incluido en imageio-ffmpeg
         ruta = imageio_ffmpeg.get_ffmpeg_exe()
-
-        # Verificar que el binario funcione ejecutando 'ffmpeg -version'
         resultado = subprocess.run(
             [ruta, "-version"],
             stdout=subprocess.PIPE,
@@ -138,28 +146,15 @@ def obtener_ruta_ffmpeg():
             return ruta
         return None
     except Exception:
-        # Si imageio_ffmpeg no encuentra el binario, lanza RuntimeError
         return None
 
 
 def descargar_mediamtx():
     """
-    Descarga y extrae MediaMTX, el servidor RTSP/RTMP/HLS/WebRTC.
-    MediaMTX actúa como el punto de distribución RTSP: recibe el flujo
-    de FFmpeg y lo re-distribuye a todos los clientes (receptores) que
-    se conecten a la URL RTSP.
-
-    MediaMTX implementa la señalización RTSP completa:
-      - DESCRIBE: el cliente solicita la descripción SDP del flujo
-      - SETUP: se negocian los puertos RTP/RTCP para el transporte
-      - PLAY: inicia la transmisión de paquetes RTP con el vídeo H.264
-      - TEARDOWN: finaliza la sesión RTSP
-
+    Descarga y extrae el servidor MediaMTX.
     Retorna la ruta al ejecutable de MediaMTX.
     """
     exe_path = os.path.join(DIR_MEDIAMTX, "mediamtx.exe")
-
-    # Si ya existe el ejecutable, no descargar de nuevo
     if os.path.isfile(exe_path):
         print(f"  ✓ MediaMTX ya existe en: {exe_path}")
         return exe_path
@@ -167,21 +162,14 @@ def descargar_mediamtx():
     print(f"  ↓ Descargando MediaMTX {MEDIAMTX_VERSION} ...")
     print(f"    URL: {MEDIAMTX_URL}")
 
-    # Crear el directorio si no existe
     os.makedirs(DIR_MEDIAMTX, exist_ok=True)
-
-    # Descargar el archivo ZIP
     zip_path = os.path.join(DIR_MEDIAMTX, "mediamtx.zip")
     try:
         urllib.request.urlretrieve(MEDIAMTX_URL, zip_path)
     except Exception as e:
         print(f"  ✗ Error al descargar MediaMTX: {e}")
-        print("    Descárgalo manualmente desde:")
-        print(f"    {MEDIAMTX_URL}")
-        print(f"    y extráelo en: {DIR_MEDIAMTX}")
         sys.exit(1)
 
-    # Extraer el contenido del ZIP
     print("  ↓ Extrayendo MediaMTX ...")
     try:
         with zipfile.ZipFile(zip_path, 'r') as zip_ref:
@@ -191,7 +179,6 @@ def descargar_mediamtx():
         os.remove(zip_path)
         sys.exit(1)
 
-    # Limpiar el archivo ZIP
     os.remove(zip_path)
 
     if os.path.isfile(exe_path):
@@ -204,31 +191,15 @@ def descargar_mediamtx():
 
 def iniciar_mediamtx(puerto):
     """
-    Inicia el servidor MediaMTX como un proceso en segundo plano.
-    El servidor escucha en el puerto RTSP indicado y acepta flujos
-    publicados por FFmpeg.
-
-    MediaMTX gestiona la capa de señalización RTSP (TCP, puerto 8554)
-    y la capa de transporte RTP (UDP, puertos efímeros negociados
-    durante el SETUP RTSP).
-
-    Args:
-        puerto: Puerto TCP en el que el servidor RTSP escuchará.
-
-    Retorna el objeto subprocess.Popen del proceso MediaMTX.
+    Inicia el servidor MediaMTX en el puerto indicado.
+    Retorna el objeto subprocess.Popen del proceso.
     """
     exe_path = descargar_mediamtx()
-
-    # Configurar la variable de entorno para cambiar el puerto RTSP
-    # MediaMTX lee MTX_RTSPADDRESS para saber en qué dirección/puerto escuchar
     entorno = os.environ.copy()
     entorno["MTX_RTSPADDRESS"] = f":{puerto}"
 
     print(f"  → Iniciando MediaMTX en el puerto {puerto} ...")
-
     try:
-        # Iniciar MediaMTX como proceso hijo
-        # Redirigir stdout/stderr para capturar mensajes del servidor
         proceso_mtx = subprocess.Popen(
             [exe_path],
             cwd=DIR_MEDIAMTX,
@@ -238,19 +209,14 @@ def iniciar_mediamtx(puerto):
             creationflags=subprocess.CREATE_NO_WINDOW if platform.system() == "Windows" else 0
         )
     except PermissionError:
-        print("  ✗ Sin permisos para ejecutar MediaMTX.")
-        print("    Intenta ejecutar como administrador o permite el acceso en el firewall.")
+        print("  ✗ Sin permisos para ejecutar MediaMTX. Ejecuta como administrador.")
         sys.exit(1)
     except Exception as e:
         print(f"  ✗ Error al iniciar MediaMTX: {e}")
         sys.exit(1)
 
-    # Esperar un momento para que el servidor inicie completamente
     time.sleep(2)
-
-    # Verificar que el proceso siga vivo
     if proceso_mtx.poll() is not None:
-        # El proceso terminó — leer su salida para diagnóstico
         salida = proceso_mtx.stdout.read().decode(errors='replace')
         print(f"  ✗ MediaMTX terminó inesperadamente. Salida:")
         print(f"    {salida[:500]}")
@@ -260,36 +226,66 @@ def iniciar_mediamtx(puerto):
     return proceso_mtx
 
 
-def listar_camaras():
+def listar_camaras_realsense():
     """
-    Lista los dispositivos Intel RealSense conectados.
-    Retorna una lista con información de cada cámara detectada.
+    Lista todos los dispositivos Intel RealSense conectados de forma legible.
+    Retorna una lista de diccionarios con información de las cámaras.
     """
-    camaras = []
-    try:
-        ctx = rs.context()
-        for dev in ctx.query_devices():
-            nombre = dev.get_info(rs.camera_info.name)
-            sn = dev.get_info(rs.camera_info.serial_number)
-            camaras.append(f"{nombre} [S/N: {sn}]")
-    except Exception as e:
-        print(f"  ✗ Error al consultar dispositivos RealSense: {e}")
-    return camaras
+    contexto = rs.context()
+    dispositivos = contexto.query_devices()
+
+    if len(dispositivos) == 0:
+        print("\n  ✗ No se detectaron cámaras Intel RealSense conectadas.")
+        print("    Asegúrate de que la cámara esté conectada por USB 3.0.")
+        return []
+
+    print(f"\n  Cámaras Intel RealSense detectadas: {len(dispositivos)}")
+    print("  " + "─" * 56)
+    print(f"  {'Índice':<8} {'Nombre':<30} {'Nº de Serie'}")
+    print("  " + "─" * 56)
+
+    lista = []
+    for i, dev in enumerate(dispositivos):
+        nombre = dev.get_info(rs.camera_info.name)
+        serie = dev.get_info(rs.camera_info.serial_number)
+        print(f"  {i:<8} {nombre:<30} {serie}")
+        lista.append({"indice": i, "nombre": nombre, "serie": serie})
+
+    print("  " + "─" * 56)
+    print(f"\n  Uso: python emisor.py --cam <índice>")
+    return lista
+
+
+# Alias para compatibilidad
+listar_camaras = listar_camaras_realsense
+
+
+def obtener_serial_por_indice(indice):
+    """
+    Obtiene el número de serie de la cámara RealSense en el índice dado.
+    """
+    contexto = rs.context()
+    dispositivos = contexto.query_devices()
+
+    if len(dispositivos) == 0:
+        print("  ✗ No se detectaron cámaras Intel RealSense.")
+        sys.exit(1)
+
+    if indice >= len(dispositivos):
+        print(f"  ✗ Índice de cámara {indice} fuera de rango.")
+        print(f"    Solo hay {len(dispositivos)} cámara(s) disponible(s).")
+        sys.exit(1)
+
+    # Si hay solo una e índice 0, podemos usar serial directo
+    return dispositivos[indice].get_info(rs.camera_info.serial_number)
 
 
 def obtener_ip_local():
     """
     Obtiene la dirección IP local de la máquina en la red LAN.
-    Se conecta a un socket UDP externo (sin enviar datos) para
-    determinar qué interfaz de red usaría el sistema operativo
-    para alcanzar la red externa.
-
-    Retorna la IP local como cadena (e.g., '192.168.1.42').
     """
     import socket
     try:
-        # Crear un socket UDP — no se envían datos realmente
-        # Conectar a una IP pública para que el SO seleccione la interfaz correcta
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.connect(("8.8.8.8", 80))
         ip = s.getsockname()[0]
@@ -301,50 +297,31 @@ def obtener_ip_local():
 
 def dibujar_hud_realsense(canvas, x_offset, y_offset, titulo, fps, frames, segundos, resolucion):
     """
-    Dibuja un HUD con fondo gris oscuro semitransparente y 3 líneas de texto:
-      - Línea 1 (Rojo BGR): Nombre del stream (Live | RGB, Live | Infrarojo 1, etc.)
-      - Línea 2 (Verde BGR): FPS y contador de fotogramas
-      - Línea 3 (Verde BGR): Tiempo transcurrido y resolución original
-      
-    Args:
-        canvas: Lienzo maestro completo (numpy array BGR de 1920x1440).
-        x_offset: Desplazamiento X del stream en el mosaico.
-        y_offset: Desplazamiento Y del stream en el mosaico.
-        titulo: Nombre descriptivo del stream.
-        fps: FPS calculados del stream.
-        frames: Contador total de fotogramas.
-        segundos: Tiempo transcurrido en segundos.
-        resolucion: Resolución original del stream.
+    Dibuja un HUD con fondo gris oscuro semitransparente y 3 líneas de texto.
     """
-    # Caja de fondo (semitransparente gris oscuro)
-    # Margen de 10px desde la esquina superior izquierda del stream
     box_x1 = x_offset + 10
     box_y1 = y_offset + 10
     box_x2 = x_offset + 330
     box_y2 = y_offset + 85
     
-    # Crear un overlay temporal para la transparencia
     overlay = canvas.copy()
     cv2.rectangle(overlay, (box_x1, box_y1), (box_x2, box_y2), (40, 40, 40), -1)
-    
-    # Mezclar el overlay con el canvas original (60% opacidad del rectángulo)
     cv2.addWeighted(overlay, 0.6, canvas, 0.4, 0, canvas)
     
-    # Parámetros del texto
     fuente = cv2.FONT_HERSHEY_SIMPLEX
     escala = 0.45
     grosor = 1
-    salto = 20 # Espaciado vertical entre líneas
+    salto = 20
     
-    # Línea 1 (Color Rojo BGR: (0, 0, 255))
+    # Línea 1 (Rojo en BGR)
     cv2.putText(canvas, titulo, (box_x1 + 10, box_y1 + 20),
                 fuente, escala, (0, 0, 255), grosor, cv2.LINE_AA)
                 
-    # Línea 2 (Color Verde BGR: (0, 255, 0))
+    # Línea 2 (Verde en BGR)
     cv2.putText(canvas, f"FPS: {fps:.1f} | Frames: {frames}", (box_x1 + 10, box_y1 + 20 + salto),
                 fuente, escala, (0, 255, 0), grosor, cv2.LINE_AA)
                 
-    # Línea 3 (Color Verde BGR: (0, 255, 0))
+    # Línea 3 (Verde en BGR)
     cv2.putText(canvas, f"Tiempo: {int(segundos)}s | {resolucion}", (box_x1 + 10, box_y1 + 20 + 2 * salto),
                 fuente, escala, (0, 255, 0), grosor, cv2.LINE_AA)
 
@@ -356,14 +333,6 @@ def dibujar_hud_realsense(canvas, x_offset, y_offset, titulo, fps, frames, segun
 def iniciar_emisor(indice_camara=0, puerto=PUERTO_RTSP_DEFECTO, bitrate_kbps=2000):
     """
     Función principal del emisor RTSP para Intel RealSense D435.
-
-    Flujo de operación:
-    1. Verifica que FFmpeg esté instalado
-    2. Descarga/inicia MediaMTX (servidor RTSP)
-    3. Abre el pipeline de Intel RealSense D435
-    4. Lanza FFmpeg para codificar H.264 y publicar en MediaMTX vía RTSP
-    5. Lee y procesa streams (RGB, IR 1, IR 2, Profundidad), compone el mosaico y lo envía a FFmpeg
-    6. FFmpeg codifica el mosaico final a H.264 y lo envía al servidor RTSP.
     """
     proceso_mediamtx = None
     proceso_ffmpeg = None
@@ -380,8 +349,7 @@ def iniciar_emisor(indice_camara=0, puerto=PUERTO_RTSP_DEFECTO, bitrate_kbps=200
         ruta_ffmpeg = obtener_ruta_ffmpeg()
         if ruta_ffmpeg is None:
             print("  ✗ No se pudo obtener el binario de FFmpeg.")
-            print("  Asegúrate de haber instalado las dependencias:")
-            print("    pip install -r requirements.txt")
+            print("  Asegúrate de haber instalado las dependencias.")
             sys.exit(1)
         print(f"  ✓ FFmpeg encontrado: {ruta_ffmpeg}")
 
@@ -390,29 +358,15 @@ def iniciar_emisor(indice_camara=0, puerto=PUERTO_RTSP_DEFECTO, bitrate_kbps=200
         proceso_mediamtx = iniciar_mediamtx(puerto)
 
         # ─── Paso 3: Abrir la cámara RealSense D435 y configurar Streams ───────────
-        print(f"\n[3/4] Abriendo dispositivo Intel RealSense ...")
+        print(f"\n[3/4] Abriendo dispositivo Intel RealSense (índice {indice_camara}) ...")
         
-        ctx = rs.context()
-        dispositivos = ctx.query_devices()
-        if len(dispositivos) == 0:
-            print("  ✗ No se detectaron cámaras Intel RealSense conectadas.")
-            sys.exit(1)
-        
-        # Seleccionar dispositivo por índice
-        if indice_camara < len(dispositivos):
-            disp = dispositivos[indice_camara]
-        else:
-            disp = dispositivos[0]
-            print(f"  ⚠ Índice de cámara {indice_camara} no válido. Usando dispositivo por defecto (0).")
-            
-        nombre_disp = disp.get_info(rs.camera_info.name)
-        sn_disp = disp.get_info(rs.camera_info.serial_number)
-        print(f"  ✓ Dispositivo detectado: {nombre_disp} (S/N: {sn_disp})")
+        serial_cam = obtener_serial_por_indice(indice_camara)
 
         # Configurar streams con la máxima calidad y resolución nativa sin pérdida
         pipeline = rs.pipeline()
         config = rs.config()
-        config.enable_device(sn_disp)
+        if serial_cam is not None:
+            config.enable_device(serial_cam)
 
         # RGB: 1920x1080 a 30fps en formato BGR8 (nativa OpenCV)
         config.enable_stream(rs.stream.color, 1920, 1080, rs.format.bgr8, 30)
@@ -424,14 +378,16 @@ def iniciar_emisor(indice_camara=0, puerto=PUERTO_RTSP_DEFECTO, bitrate_kbps=200
 
         # Iniciar el pipeline
         print("  → Iniciando pipeline de RealSense ...")
-        profile = pipeline.start(config)
-        pipeline_started = True
-        print("  ✓ Pipeline RealSense iniciado correctamente.")
+        try:
+            profile = pipeline.start(config)
+            pipeline_started = True
+            print("  ✓ Pipeline RealSense iniciado correctamente.")
+        except RuntimeError as e:
+            print(f"  ✗ No se pudo iniciar el pipeline de RealSense: {e}")
+            print("    Asegúrate de que la cámara esté conectada por USB 3.0.")
+            sys.exit(1)
 
         # Dimensiones del lienzo final (Mosaico)
-        # Fila superior: RGB de 1920x1080
-        # Fila inferior: 3 columnas de 640x360 cada una (Ancho total = 1920, Alto = 360)
-        # Canvas completo = 1920 de ancho por 1440 de alto (1080 + 360)
         ancho_canvas = 1920
         alto_canvas = 1440
         fps_stream = 30 # Forzado por hardware
@@ -494,8 +450,12 @@ def iniciar_emisor(indice_camara=0, puerto=PUERTO_RTSP_DEFECTO, bitrate_kbps=200
         tiempo_inicio = time.time()
 
         while True:
-            # Esperar frames de RealSense
-            frames = pipeline.wait_for_frames()
+            # Esperar un conjunto sincronizado de fotogramas (RGB + Depth + IR) con timeout
+            try:
+                frames = pipeline.wait_for_frames(timeout_ms=5000)
+            except RuntimeError:
+                print("  ⚠ Timeout esperando fotogramas de la cámara...")
+                continue
 
             color_frame = frames.get_color_frame()
             ir_left_frame = frames.get_infrared_frame(1)
@@ -516,7 +476,6 @@ def iniciar_emisor(indice_camara=0, puerto=PUERTO_RTSP_DEFECTO, bitrate_kbps=200
             ir_right_bgr = cv2.cvtColor(ir_right_image, cv2.COLOR_GRAY2BGR)
 
             # ─── 2. Procesamiento de Profundidad (Normalización y Heatmap JET) ───
-            # Rango límite de profundidad en milímetros (4.0m es ideal para D435)
             max_depth_mm = 4000
             depth_clipped = np.clip(depth_image, 0, max_depth_mm)
             
@@ -526,7 +485,7 @@ def iniciar_emisor(indice_camara=0, puerto=PUERTO_RTSP_DEFECTO, bitrate_kbps=200
             # Aplicar mapa de color JET (esquema térmico)
             depth_heatmap = cv2.applyColorMap(depth_8bit, cv2.COLORMAP_JET)
             
-            # Forzar píxeles sin profundidad válida (0 mm) a color negro para evitar ruido JET (azul)
+            # Forzar píxeles sin profundidad válida (0 mm) a color negro
             depth_heatmap[depth_image == 0] = [0, 0, 0]
 
             # ─── 3. Redimensionado proporcional para el Mosaico ───
@@ -540,7 +499,6 @@ def iniciar_emisor(indice_camara=0, puerto=PUERTO_RTSP_DEFECTO, bitrate_kbps=200
             bottom_row = np.hstack([ir_left_resized, depth_heatmap_resized, ir_right_resized])
 
             # ─── 5. Composición del Lienzo Maestro ───
-            # Fila Superior (1920x1080) + Fila Inferior (1920x360) = 1920x1440
             canvas = np.vstack([color_image, bottom_row])
 
             # Calcular tiempos e información para etiquetas
@@ -553,16 +511,9 @@ def iniciar_emisor(indice_camara=0, puerto=PUERTO_RTSP_DEFECTO, bitrate_kbps=200
                 fps_calculados = 0.0
 
             # ─── 6. Dibujar las etiquetas OSD con rectángulos semitransparentes ───
-            # Fila Superior: RGB (1920x1080) -> Offset X: 0, Offset Y: 0
             dibujar_hud_realsense(canvas, 0, 0, "Live | RGB", fps_calculados, fotogramas_enviados, segundos_transcurridos, "1920x1080")
-            
-            # Fila Inferior - Izquierda: Infrarojo 1 -> Offset X: 0, Offset Y: 1080
             dibujar_hud_realsense(canvas, 0, 1080, "Live | Infrarojo 1", fps_calculados, fotogramas_enviados, segundos_transcurridos, "1280x720")
-            
-            # Fila Inferior - Centro: Profundidad -> Offset X: 640, Offset Y: 1080
             dibujar_hud_realsense(canvas, 640, 1080, "Live | Profundidad", fps_calculados, fotogramas_enviados, segundos_transcurridos, "1280x720")
-            
-            # Fila Inferior - Derecha: Infrarojo 2 -> Offset X: 1280, Offset Y: 1080
             dibujar_hud_realsense(canvas, 1280, 1080, "Live | Infrarojo 2", fps_calculados, fotogramas_enviados, segundos_transcurridos, "1280x720")
 
             # Escribir frame crudo (descomprimido) en FFmpeg stdin
@@ -596,7 +547,7 @@ def iniciar_emisor(indice_camara=0, puerto=PUERTO_RTSP_DEFECTO, bitrate_kbps=200
         if pipeline_started and pipeline is not None:
             try:
                 pipeline.stop()
-                print("  ✓ Pipeline RealSense detenido")
+                print("  ✓ Pipeline RealSense detenido y cámara liberada")
             except Exception as e:
                 print(f"  ✗ Error al detener el pipeline RealSense: {e}")
 
@@ -635,16 +586,16 @@ def iniciar_emisor(indice_camara=0, puerto=PUERTO_RTSP_DEFECTO, bitrate_kbps=200
 # ═══════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    # Parsear argumentos de línea de comandos
     parser = argparse.ArgumentParser(
-        description="Emisor RTSP: transmite la cámara local por protocolo RTSP.",
+        description="Emisor RTSP: transmite vídeo RGB + Profundidad + Infrarrojos de una cámara Intel RealSense D435.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Ejemplos de uso:
   python emisor.py                          # Cámara 0, puerto 8554, 2000 kbps
-  python emisor.py --cam 1                  # Usar segunda cámara
+  python emisor.py --cam 1                  # Usar segunda cámara RealSense
   python emisor.py --puerto 9554            # Usar puerto alternativo
   python emisor.py --calidad 4000           # Mayor calidad de vídeo
+  python emisor.py --listar-camaras         # Ver cámaras RealSense detectadas
   python emisor.py --cam 0 --puerto 8554    # Todos los parámetros explícitos
         """
     )
@@ -659,7 +610,7 @@ Ejemplos de uso:
         "--cam",
         type=int,
         default=0,
-        help="Índice de la cámara a usar (por defecto: 0)"
+        help="Índice de la cámara RealSense a usar (por defecto: 0)"
     )
     parser.add_argument(
         "--calidad",
@@ -670,19 +621,15 @@ Ejemplos de uso:
     parser.add_argument(
         "--listar-camaras",
         action="store_true",
-        help="Listar cámaras disponibles y salir"
+        help="Listar cámaras Intel RealSense conectadas y salir"
     )
 
     args = parser.parse_args()
 
-    # Si se pide listar cámaras, mostrar y salir
+    # Si se pide listar cámaras, mostrar info de RealSense y salir
     if args.listar_camaras:
-        print("Buscando cámaras disponibles ...")
-        camaras = listar_camaras()
-        if camaras:
-            print(f"  Cámaras detectadas en índices: {camaras}")
-        else:
-            print("  No se detectaron cámaras.")
+        print("Buscando cámaras Intel RealSense ...")
+        listar_camaras_realsense()
         sys.exit(0)
 
     # Iniciar el emisor con los parámetros proporcionados
