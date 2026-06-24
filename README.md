@@ -475,24 +475,53 @@ source .venv/bin/activate
 python3 receptor_ubuntu.py 192.168.1.42
 ```
 
-### Nota sobre WSL (Windows Subsystem for Linux)
+### Instalación en Ubuntu Nativo (Raspberry Pi, Jetson, PC)
 
-| Componente | ¿Funciona en WSL2? | Notas |
-|------------|-------------------|-------|
-| **Receptor** | ✅ Sí | Necesita WSLg (Windows 11) o un servidor X como VcXsrv (Windows 10) para la ventana gráfica. |
-| **Emisor** | ⚠️ Limitado | La cámara RealSense es USB físico. WSL2 no la ve directamente. Requiere `usbipd-win` para hacer passthrough del USB, lo cual es complejo y frágil. **Recomendación:** usar el emisor en Windows nativo o en un Ubuntu real. |
+En un sistema Linux nativo, el kernel ya incluye los controladores de video (UVC) necesarios. 
+1. Sigue las instrucciones de **Ejecución en Linux / Ubuntu** descritas arriba (`pip install -r requirements.txt`).
+2. Conecta la cámara.
+3. Si el script arroja el error "No se detectaron cámaras", suele ser un problema de permisos de usuario. Solo necesitas instalar las reglas `udev` de Intel:
+   ```bash
+   # Descargar las reglas de udev de Intel RealSense
+   wget https://raw.githubusercontent.com/IntelRealSense/librealsense/master/config/99-realsense-libusb.rules
+   sudo cp 99-realsense-libusb.rules /etc/udev/rules.d/
+   sudo udevadm control --reload-rules && sudo udevadm trigger
+   ```
+4. Vuelve a conectar la cámara y ejecuta el script normalmente (sin `sudo`).
 
-### Permisos USB para RealSense en Linux nativo
+### Ejecución del Emisor en WSL2 (Windows Subsystem for Linux)
 
-Si la cámara no es detectada en Linux, es posible que necesites instalar las reglas udev de Intel RealSense:
+Ejecutar el Emisor en WSL2 es un caso especial complejo. WSL2 no tiene un kernel con controladores de video USB nativos. Para que funcione, hay que vincular el puerto USB a WSL y compilar la librería para que lea el USB en bruto (ignorando el kernel).
 
+**Paso 1: Vincular la cámara desde Windows a WSL**
+1. En Windows, abre PowerShell como Administrador e instala `usbipd`:
+   ```powershell
+   winget install --interactive --exact dorssel.usbipd-win
+   ```
+2. Lista los dispositivos USB en PowerShell:
+   ```powershell
+   usbipd list
+   ```
+3. Busca "Intel RealSense", anota su `BUSID` (ej: `2-1`) y vincúlalo a WSL:
+   ```powershell
+   usbipd bind --busid <BUSID>
+   usbipd attach --wsl --busid <BUSID>
+   ```
+
+**Paso 2: Compilar librealsense en WSL**
+Como la versión normal de `pip` no funciona en WSL por falta de drivers de video, debes usar el script `install_realsense.sh` provisto en este repositorio. Este script compila el SDK forzando el protocolo USB (`FORCE_LIBUVC=true`). 
+
+Dentro de tu terminal Ubuntu, ejecuta:
 ```bash
-# Opción 1: Instalar librealsense desde el repositorio oficial de Intel
-# Ver: https://github.com/IntelRealSense/librealsense/blob/master/doc/distribution_linux.md
+bash install_realsense.sh
+```
+*(Este proceso tomará de 15 a 30 minutos y copiará automáticamente la librería correcta a tu entorno `.venvv`).*
 
-# Opción 2: Copiar las reglas udev manualmente
-sudo cp 99-realsense-libusb.rules /etc/udev/rules.d/
-sudo udevadm control --reload-rules && sudo udevadm trigger
+**Paso 3: Ejecutar con permisos de superusuario**
+Debido a las políticas de hardware virtualizado en WSL, debes correr el script usando `sudo` y apuntando directamente al Python de tu entorno virtual:
+```bash
+# Cambia la ruta según donde tengas tu proyecto clonado
+sudo /mnt/c/Users/Lenovo/Documents/GitHub/Formato-RTSP/.venvv/bin/python3 emisor_ubuntu.py
 ```
 
 ---

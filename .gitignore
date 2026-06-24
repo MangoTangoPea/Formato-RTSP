@@ -1,5 +1,7 @@
 # Entorno virtual de Python
 .venv/
+.venvv/
+venv/
 
 # MediaMTX (servidor RTSP, descargado automáticamente)
 mediamtx/
