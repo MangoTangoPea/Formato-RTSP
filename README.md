@@ -524,6 +524,24 @@ Debido a las políticas de hardware virtualizado en WSL, debes correr el script 
 sudo /mnt/c/Users/Lenovo/Documents/GitHub/Formato-RTSP/.venvv/bin/python3 emisor_ubuntu.py
 ```
 
+**Paso 4: Limpiar almacenamiento (Opcional)**
+La compilación del código fuente genera entre 1 GB y 2 GB de archivos temporales. Como la librería final ya se guardó en tu entorno virtual, puedes borrar la carpeta temporal de Intel en Ubuntu para recuperar tu espacio:
+```bash
+rm -rf ~/librealsense
+```
+
+**Paso 5: Devolver la cámara a Windows (Desvincular USB)**
+Mientras la cámara esté vinculada a WSL, Windows no podrá usarla. Para devolvérsela a Windows, simplemente desconecta el cable USB y vuélvelo a conectar. Alternativamente, puedes usar PowerShell como Administrador:
+```powershell
+usbipd detach --busid <BUSID>
+# Si ya no vas a usar WSL en un buen tiempo, puedes desvincularla por completo:
+usbipd unbind --busid <BUSID>
+```
+*(Opcional) Si en el futuro deseas desinstalar por completo la herramienta `usbipd-win` de tu sistema Windows, puedes hacerlo con:*
+```powershell
+winget uninstall dorssel.usbipd-win
+```
+
 ---
 
 ## Estructura del proyecto
