@@ -234,19 +234,51 @@ python emisor.py --listar-camaras  # Ver cámaras disponibles
 
 ### Paso 3: Ejecuta el receptor (otra máquina)
 
-En la otra computadora, abre PowerShell:
+#### En Windows (PowerShell)
 
-```powershell
-cd "C:\ruta\al\proyecto"
-.\.venv\Scripts\Activate.ps1
-python receptor.py 192.168.1.42
-```
+1. Abre PowerShell y navega a la carpeta del proyecto:
+   ```powershell
+   cd "C:\ruta\al\proyecto"
+   ```
+2. Activa el entorno virtual:
+   ```powershell
+   .\.venv\Scripts\Activate.ps1
+   ```
+3. Ejecuta el receptor:
+   ```powershell
+   python receptor.py 192.168.1.42
+   ```
+   *(También puedes usar la URL completa: `python receptor.py rtsp://192.168.1.42:8554/camara`)*
 
-O con la URL RTSP completa:
+#### En Ubuntu (WSL / Linux)
 
-```powershell
-python receptor.py rtsp://192.168.1.42:8554/camara
-```
+1. Abre la terminal de Ubuntu y navega al proyecto:
+   ```bash
+   cd "/mnt/c/Users/<TuUsuario>/Documents/GitHub/Formato-RTSP"
+   ```
+2. Si necesitas limpiar y crear el entorno virtual de cero en Ubuntu:
+   ```bash
+   deactivate 2>/dev/null
+   rm -rf .venv .venvv
+   python3 -m venv .venv
+   source .venv/bin/activate
+   pip install -r requirements.txt
+   ```
+3. Instala las dependencias gráficas del sistema requeridas para evitar errores de Qt/XCB (`could not connect to display`):
+   ```bash
+   sudo apt update
+   sudo apt install -y libxcb-xinerama0 libqt5gui5 libgl1-mesa-glx libglib2.0-0
+   ```
+4. Asegura la redirección de pantalla (Display) para que se dibuje la interfaz en Windows:
+   - **En Windows 11 (WSLg):** Se gestiona automáticamente. Verifica con `echo $DISPLAY` (debe mostrar `:0` o similar).
+   - **En Windows 10:** Ejecuta un servidor X en Windows (como *VcXsrv* o *Xming*) y ejecuta en la terminal de Ubuntu:
+     ```bash
+     export DISPLAY=$(ip route | grep default | awk '{print $3}'):0
+     ```
+5. Ejecuta el receptor adaptado para Linux/Ubuntu:
+   ```bash
+   python3 receptor_ubuntu.py 192.168.1.42
+   ```
 
 Deberías ver:
 
@@ -520,8 +552,8 @@ bash install_realsense.sh
 **Paso 3: Ejecutar con permisos de superusuario**
 Debido a las políticas de hardware virtualizado en WSL, debes correr el script usando `sudo` y apuntando directamente al Python de tu entorno virtual:
 ```bash
-# Cambia la ruta según donde tengas tu proyecto clonado
-sudo /mnt/c/Users/Lenovo/Documents/GitHub/Formato-RTSP/.venvv/bin/python3 emisor_ubuntu.py
+# Cambia la ruta según donde tengas tu proyecto clonado (por ejemplo, con tu usuario de Windows)
+sudo /mnt/c/Users/<TuUsuario>/Documents/GitHub/Formato-RTSP/.venvv/bin/python3 emisor_ubuntu.py
 ```
 
 **Paso 4: Limpiar almacenamiento (Opcional)**
