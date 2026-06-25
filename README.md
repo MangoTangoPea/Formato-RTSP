@@ -49,13 +49,18 @@ En un sistema Linux nativo, el kernel ya incluye los controladores de video nece
    sudo udevadm control --reload-rules && sudo udevadm trigger
    ```
 3. **Ejecutar el Emisor:**
+   Abre una terminal y ejecuta:
    ```bash
+   cd /ruta/al/proyecto
+   source .venv/bin/activate
    python3 emisor_ubuntu.py
    ```
 4. **Ejecutar el Receptor:**
-   En otra terminal o computadora, ejecuta:
+   En otra terminal o en otra computadora, ejecuta:
    ```bash
-   python3 receptor_ubuntu.py 127.0.0.1
+   cd /ruta/al/proyecto
+   source .venv/bin/activate
+   python3 receptor_ubuntu.py 127.0.0.1  # Usa la IP real si es en otra computadora
    ```
 
 ---
@@ -111,13 +116,24 @@ usbipd unbind --busid <TU_BUSID>
 ---
 
 ## 📡 Ejecutar el receptor en OTRA computadora
-El protocolo RTSP está diseñado para redes. Para ver la cámara desde otra computadora física:
-1. Asegúrate de que ambas PC estén en el mismo WiFi/Red.
-2. Descubre la IP de la computadora que tiene la cámara (ej: `ipconfig` en Windows -> `192.168.1.42`).
-3. En la segunda computadora ejecuta el receptor apuntando a esa IP:
-   ```bash
-   python receptor.py 192.168.1.42
-   ```
+El protocolo RTSP está diseñado para redes. Para ver la cámara desde otra computadora física conectada al mismo WiFi o cable:
+
+1. Descubre la IP de la computadora que tiene la cámara conectada (En Windows abre PowerShell y escribe `ipconfig` -> busca Dirección IPv4, ej: `192.168.1.42`).
+2. Ve a la **segunda computadora** (la que va a recibir el video), abre la terminal, activa el entorno y ejecuta el script apuntando a esa IP.
+
+**Si el receptor es Windows:**
+```powershell
+cd "C:\ruta\al\proyecto"
+.\venv\Scripts\Activate.ps1
+python receptor.py 192.168.1.42
+```
+
+**Si el receptor es Ubuntu/Linux:**
+```bash
+cd /ruta/al/proyecto
+source .venv/bin/activate
+python3 receptor_ubuntu.py 192.168.1.42
+```
 
 *(Nota: Si usas el emisor dentro de WSL, Windows bloqueará la conexión a otras computadoras físicas. Para transmitir a otra PC, es altamente recomendado usar el emisor en Windows Nativo u Ubuntu Nativo).*
 
