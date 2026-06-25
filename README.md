@@ -517,20 +517,29 @@ bash install_realsense.sh
 ```
 *(Este proceso tomará de 15 a 30 minutos y copiará automáticamente la librería correcta a tu entorno `.venvv`).*
 
-**Paso 3: Ejecutar con permisos de superusuario**
+**Paso 3: Ejecutar el Emisor (con permisos de superusuario)**
 Debido a las políticas de hardware virtualizado en WSL, debes correr el script usando `sudo` y apuntando directamente al Python de tu entorno virtual:
 ```bash
-# Cambia la ruta según donde tengas tu proyecto clonado
+# Mantén esta terminal abierta mientras uses la cámara
 sudo /mnt/c/Users/Lenovo/Documents/GitHub/Formato-RTSP/.venvv/bin/python3 emisor_ubuntu.py
 ```
 
-**Paso 4: Limpiar almacenamiento (Opcional)**
+**Paso 4: Ejecutar el Receptor (en paralelo)**
+Mientras el emisor está corriendo en su terminal, abre una **NUEVA** pestaña o ventana de Ubuntu (WSL). En esta nueva terminal, ejecuta el receptor apuntando a tu IP local (`127.0.0.1`):
+```bash
+cd /mnt/c/Users/Lenovo/Documents/GitHub/Formato-RTSP
+source .venvv/bin/activate
+python3 receptor_ubuntu.py 127.0.0.1
+```
+*(Nota: Si usas Windows 10 y recibes un error tipo `cannot connect to X server`, ejecuta el `receptor.py` normal de Windows desde PowerShell, ya que WSL2 en Windows 10 no trae soporte gráfico nativo).*
+
+**Paso 5: Limpiar almacenamiento (Opcional)**
 La compilación del código fuente genera entre 1 GB y 2 GB de archivos temporales. Como la librería final ya se guardó en tu entorno virtual, puedes borrar la carpeta temporal de Intel en Ubuntu para recuperar tu espacio:
 ```bash
 rm -rf ~/librealsense
 ```
 
-**Paso 5: Devolver la cámara a Windows (Desvincular USB)**
+**Paso 6: Devolver la cámara a Windows (Desvincular USB)**
 Mientras la cámara esté vinculada a WSL, Windows no podrá usarla. Para devolvérsela a Windows, simplemente desconecta el cable USB y vuélvelo a conectar. Alternativamente, puedes usar PowerShell como Administrador:
 ```powershell
 usbipd detach --busid <BUSID>
