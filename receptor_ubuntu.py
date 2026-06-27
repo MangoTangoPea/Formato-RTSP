@@ -1,37 +1,10 @@
 #!/usr/bin/env python3
 """
-Receptor RTSP Multicanal — Versión Linux/Ubuntu.
+Receptor RTSP Multicanal — Versión Linux/Ubuntu (Corregido sin márgenes).
 
 Se conecta a 4 flujos RTSP independientes de la cámara Intel RealSense D435
 (Color, IR1, IR2, Depth) usando hilos dedicados y los muestra en tiempo real
-con controles interactivos en OpenCV.
-
-Arquitectura de recepción:
-──────────────────────────
-  ┌─────────────────┐      RTSP/RTP (/color) ┌───────────────────┐
-  │                 │ ─────────────────────► │ Reader-Color      │ ──┐
-  │                 │      RTSP/RTP (/depth) ├───────────────────┤   │
-  │  RealSense      │ ─────────────────────► │ Reader-Depth      │ ──┼─► [Bucle Principal]
-  │  D435 (emisor)  │      RTSP/RTP (/ir1)   ├───────────────────┤   │   - Composición local
-  │                 │ ─────────────────────► │ Reader-IR1        │ ──┤   - Render OSD nítido
-  │                 │      RTSP/RTP (/ir2)   ├───────────────────┤   │   - Cambio de vistas
-  │                 │ ─────────────────────► │ Reader-IR2        │ ──┘
-  └─────────────────┘                        └───────────────────┘
-
-Requisitos en Ubuntu/Debian:
-    sudo apt update
-    sudo apt install python3-venv python3-pip libgl1 libglib2.0-0
-    python3 -m venv .venv
-    source .venv/bin/activate
-    pip install -r requirements.txt
-
-Teclas de control en la ventana:
-  - 'm' o 'M': Modo Mosaico (RGB superior, IR1/Depth/IR2 inferiores).
-  - '1': Vista exclusiva RGB (resolución nativa 1920x1080).
-  - '2': Vista exclusiva IR1 (resolución nativa 1280x720).
-  - '3': Vista exclusiva Profundidad (resolución nativa 1280x720).
-  - '4': Vista exclusiva IR2 (resolución nativa 1280x720).
-  - 'q' o 'Q' o ESC: Salir.
+con controles interactivos en OpenCV ocupando toda la pantalla.
 """
 
 import sys
@@ -214,32 +187,6 @@ def dibujar_hud_panel(frame, titulo, fps, frames, segundos, resolucion, color_te
                 fuente, escala, color_tema, grosor, cv2.LINE_AA)
 
 
-def letterbox(frame, ancho_ventana, alto_ventana):
-    """
-    Escala el frame para que quepa en la ventana sin deformarse (mantiene
-    la relación de aspecto) y lo centra sobre un fondo negro.
-    """
-    if ancho_ventana <= 0 or alto_ventana <= 0:
-        return frame
-
-    alto_frame, ancho_frame = frame.shape[:2]
-    escala = min(ancho_ventana / ancho_frame, alto_ventana / alto_frame)
-
-    nuevo_ancho = int(ancho_frame * escala)
-    nuevo_alto = int(alto_frame * escala)
-
-    frame_escalado = cv2.resize(frame, (nuevo_ancho, nuevo_alto),
-                                interpolation=cv2.INTER_LINEAR)
-
-    # Crear lienzo negro del tamaño de la ventana y centrar el frame
-    lienzo = np.zeros((alto_ventana, ancho_ventana, 3), dtype=np.uint8)
-    x_offset = (ancho_ventana - nuevo_ancho) // 2
-    y_offset = (alto_ventana - nuevo_alto) // 2
-    lienzo[y_offset:y_offset + nuevo_alto, x_offset:x_offset + nuevo_ancho] = frame_escalado
-
-    return lienzo
-
-
 # ═══════════════════════════════════════════════════════════════════════════
 # FUNCIÓN PRINCIPAL DEL RECEPTOR
 # ═══════════════════════════════════════════════════════════════════════════
@@ -260,15 +207,8 @@ def iniciar_receptor(url_base_ip, puerto, mostrar_hud_info=True):
     print(f"  Depth Map:     {url_depth}")
     print(f"  Infrared 1:    {url_ir1}")
     print(f"  Infrared 2:    {url_ir2}")
-    print(f"  Ventana:       Redimensionable (cv2.WINDOW_NORMAL)")
+    print(f"  Ventana:       Redimensionable Limpia")
     print("═" * 60)
-    print("\n  Atajos de teclado en la ventana de vídeo:")
-    print("    [m] Modo Mosaico (Completo 4 streams)")
-    print("    [1] Vista exclusiva RGB (1920x1080)")
-    print("    [2] Vista exclusiva Infrarrojo 1 (1280x720)")
-    print("    [3] Vista exclusiva Profundidad (1280x720)")
-    print("    [4] Vista exclusiva Infrarrojo 2 (1280x720)")
-    print("    [q] Salir\n")
 
     # Iniciar los hilos lectores de flujos
     reader_color = RTSPStreamReader(url_color, "Color")
@@ -281,7 +221,8 @@ def iniciar_receptor(url_base_ip, puerto, mostrar_hud_info=True):
     reader_ir1.start()
     reader_ir2.start()
 
-    cv2.namedWindow(NOMBRE_VENTANA, cv2.WINDOW_NORMAL)
+    # CAMBIO AQUÍ: Se añade cv2.WINDOW_GUI_NORMAL para ocultar la barra blanca de botones de Linux/Qt
+    cv2.namedWindow(NOMBRE_VENTANA, cv2.WINDOW_NORMAL | cv2.WINDOW_GUI_NORMAL)
     cv2.resizeWindow(NOMBRE_VENTANA, 1440, 1080)
 
     # Estado de la UI
@@ -315,7 +256,7 @@ def iniciar_receptor(url_base_ip, puerto, mostrar_hud_info=True):
             if frame_ir2 is None:
                 frame_ir2 = generar_placeholder(1280, 720, "Esperando canal Infrarrojo 2 ...")
 
-            # Garantizar que todos los frames tengan 3 canales para poder mezclar y dibujar OSD en color
+            # Garantizar que todos los frames tengan 3 canales
             if len(frame_ir1.shape) == 2 or frame_ir1.shape[2] == 1:
                 frame_ir1 = cv2.cvtColor(frame_ir1, cv2.COLOR_GRAY2BGR)
             if len(frame_ir2.shape) == 2 or frame_ir2.shape[2] == 1:
@@ -328,7 +269,7 @@ def iniciar_receptor(url_base_ip, puerto, mostrar_hud_info=True):
             if modo_vista == "mosaico":
                 titulo_ventana = f"{NOMBRE_VENTANA} — Modo Mosaico [m]"
                 
-                # Redimensionar paneles inferiores a 640x360 con Lanczos4 para el mosaico
+                # Redimensionar paneles inferiores a 640x360
                 ir1_resized = cv2.resize(frame_ir1, (640, 360), interpolation=cv2.INTER_LANCZOS4)
                 depth_resized = cv2.resize(frame_depth, (640, 360), interpolation=cv2.INTER_LANCZOS4)
                 ir2_resized = cv2.resize(frame_ir2, (640, 360), interpolation=cv2.INTER_LANCZOS4)
@@ -368,16 +309,9 @@ def iniciar_receptor(url_base_ip, puerto, mostrar_hud_info=True):
                     dibujar_hud_panel(frame_ir2, "IR2 (Derecho) - Resolucion Nativa", fps_ir2, f_ir2, segundos_transcurridos, "1280x720", (0, 255, 0), "top-left")
                 canvas_mostrar = frame_ir2
 
-            # Mostrar el lienzo y actualizar título
+            # CAMBIO AQUÍ: Se eliminó la función letterbox. Ahora se envía directo a cv2.imshow
+            # OpenCV expandirá el video de forma nativa para rellenar toda la ventana de inmediato.
             if canvas_mostrar is not None:
-                # Obtener tamaño real de la ventana para hacer letterbox
-                try:
-                    ancho_win = int(cv2.getWindowImageRect(NOMBRE_VENTANA)[2])
-                    alto_win = int(cv2.getWindowImageRect(NOMBRE_VENTANA)[3])
-                    if ancho_win > 0 and alto_win > 0:
-                        canvas_mostrar = letterbox(canvas_mostrar, ancho_win, alto_win)
-                except Exception:
-                    pass
                 cv2.imshow(NOMBRE_VENTANA, canvas_mostrar)
                 try:
                     cv2.setWindowTitle(NOMBRE_VENTANA, titulo_ventana)
@@ -405,7 +339,7 @@ def iniciar_receptor(url_base_ip, puerto, mostrar_hud_info=True):
                 modo_vista = "ir2"
                 print("  → Vista exclusiva: Infrarrojo 2 (Right 1280x720)")
 
-            # Cerrar el bucle si el usuario cerró la ventana manualmente desde la X
+            # Cerrar si se cierra la ventana desde la X
             if cv2.getWindowProperty(NOMBRE_VENTANA, cv2.WND_PROP_VISIBLE) < 1:
                 print("\n  ⏹ Ventana cerrada por el usuario.")
                 break
@@ -421,7 +355,6 @@ def iniciar_receptor(url_base_ip, puerto, mostrar_hud_info=True):
         reader_ir2.stop()
         cv2.destroyAllWindows()
         print("  ✓ Hilos detenidos y recursos liberados.")
-        print("\n  Receptor finalizado.\n")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -430,34 +363,15 @@ def iniciar_receptor(url_base_ip, puerto, mostrar_hud_info=True):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Receptor RTSP Multicanal (Linux/Ubuntu): recibe y visualiza 4 flujos independientes de una Intel RealSense D435.",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Ejemplos de uso:
-  python3 receptor_ubuntu.py rtsp://192.168.1.42:8554/camara      # Extrae la IP e inicia los 4 canales
-  python3 receptor_ubuntu.py 192.168.1.42                          # IP con puerto/rutas por defecto
-  python3 receptor_ubuntu.py 192.168.1.42 8554                     # IP y puerto alternativo
-  python3 receptor_ubuntu.py --sin-hud 192.168.1.42                # Sin overlay de info OSD
-
-Requisitos previos en Ubuntu/Debian:
-  sudo apt update
-  sudo apt install python3-venv python3-pip libgl1 libglib2.0-0
-  python3 -m venv .venv
-  source .venv/bin/activate
-  pip install -r requirements.txt
-
-Nota WSL2 (Windows Subsystem for Linux):
-  - El receptor funciona en WSL2 con WSLg (Windows 11).
-  - En Windows 10, necesitas un servidor X como VcXsrv.
-  - Asegurate de que la IP del emisor sea alcanzable desde WSL.
-        """
+        description="Receptor RTSP Multicanal (Linux/Ubuntu CORREGIDO)",
+        formatter_class=argparse.RawDescriptionHelpFormatter
     )
 
     parser.add_argument(
         "destino",
         nargs="?",
         default=None,
-        help="URL RTSP completa (rtsp://IP:puerto/ruta) o dirección IP del emisor"
+        help="URL RTSP completa o dirección IP del emisor"
     )
     parser.add_argument(
         "puerto",
@@ -474,13 +388,11 @@ Nota WSL2 (Windows Subsystem for Linux):
 
     args = parser.parse_args()
 
-    # Resolver IP de destino a partir de los argumentos
     ip_destino = "127.0.0.1"
     puerto_destino = args.puerto
 
     if args.destino is not None:
         if args.destino.startswith("rtsp://"):
-            # Extraer IP y puerto de la URL completa rtsp://IP:puerto/ruta
             sin_protocolo = args.destino[7:]
             if "/" in sin_protocolo:
                 host_puerto = sin_protocolo.split("/")[0]
@@ -499,5 +411,4 @@ Nota WSL2 (Windows Subsystem for Linux):
         else:
             ip_destino = args.destino
 
-    # Iniciar el receptor
     iniciar_receptor(ip_destino, puerto_destino, mostrar_hud_info=not args.sin_hud)
