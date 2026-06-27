@@ -1,6 +1,6 @@
 # Demo RTSP — Transmisión de Mosaico RealSense D435
 
-Sistema de transmisión de vídeo en tiempo real en red local utilizando el protocolo **RTSP**. El emisor captura streams simultáneos (RGB, Infrarrojos y Profundidad) de una cámara **Intel RealSense D435**, compone un mosaico de alta resolución (1920x1440) con OSD y lo transmite de forma fluida.
+Sistema de transmisión de vídeo en tiempo real en red local utilizando el protocolo **RTSP**. El emisor captura streams simultáneos (RGB, Infrarrojos y Profundidad) de una cámara **Intel RealSense D435**, los publica como 4 canales RTSP independientes y el receptor los recibe, combinándolos en un mosaico interactivo de alta resolución (1920x1440) con controles de vista.
 
 ## Arquitectura del sistema
 
@@ -11,13 +11,16 @@ Sistema de transmisión de vídeo en tiempo real en red local utilizando el prot
   └────────┬─────────┘               
            │ (4 streams)             
            ▼                         
-      ┌──────────┐    mosaico raw     ┌─────────┐   RTSP/RTP    ┌──────────┐
+      ┌──────────┐    raw frames      ┌─────────┐   RTSP/RTP    ┌──────────┐
       │  Emisor  │ ─────────────────► │ FFmpeg  │ ────────────► │ MediaMTX │
       │ (Python) │   vía pipe/stdin   │ (H.264) │  ANNOUNCE +   │ (server  │
-      │          │   (1920x1440 BGR)  │         │  RECORD        │  RTSP)   │
+      │          │   (4 canales)      │ x4 proc │  RECORD        │  RTSP)   │
       └──────────┘                    └─────────┘               └────┬─────┘
        emisor.py                                                     │
-                                                          rtsp://<IP>:8554/camara
+                                                   rtsp://<IP>:8554/color
+                                                   rtsp://<IP>:8554/depth
+                                                   rtsp://<IP>:8554/ir1
+                                                   rtsp://<IP>:8554/ir2
                                                                      │
                                                                 ┌────▼─────┐
                                                                 │ Receptor │
@@ -42,8 +45,8 @@ Sistema de transmisión de vídeo en tiempo real en red local utilizando el prot
 
 | Componente | Rol | Descripción |
 |------------|-----|-------------|
-| **`emisor.py`** | Publicador RTSP | Captura 4 flujos nativos (Color, Depth, IR1, IR2) de la Intel RealSense D435, compone el mosaico, añade overlays de texto HUD, y envía el canvas raw (1920x1440) a FFmpeg vía stdin. |
-| **`receptor.py`** | Cliente RTSP | Se conecta al servidor, recibe y decodifica el flujo de mosaico H.264 para mostrarlo en tiempo real. |
+| **`emisor.py`** | Publicador RTSP | Captura 4 flujos nativos (Color, Depth, IR1, IR2) de la Intel RealSense D435 y los publica como canales RTSP independientes. |
+| **`receptor.py`** | Cliente RTSP | Se conecta a los 4 canales, los combina en un mosaico interactivo y permite ver cada canal individualmente. |
 | **MediaMTX** | Servidor RTSP (Broker) | Servidor ligero de alta velocidad que gestiona el streaming RTSP. Recibe la publicación de FFmpeg y la retransmite bajo demanda. |
 | **FFmpeg** | Codificador de Vídeo | Codifica en tiempo real los frames crudos BGR24 en paquetes H.264 comprimidos de baja latencia. |
 
@@ -54,54 +57,6 @@ Sistema de transmisión de vídeo en tiempo real en red local utilizando el prot
 1. **Multiplexado de Clientes**: Una cámara física RealSense solo puede estar abierta por un proceso de captura a la vez. MediaMTX permite que el emisor envíe el vídeo **una sola vez** al servidor, y este se encarga de retransmitir el flujo simultáneamente a todos los clientes (receptores) que se conecten, sin saturar la cámara.
 2. **Puente entre Codificador y Clientes**: FFmpeg se encarga de codificar pero no actúa como un servidor de red pasivo. MediaMTX corre de fondo esperando conexiones, y permite a FFmpeg publicar su flujo mediante el comando `ANNOUNCE` y `RECORD`, manteniendo el canal abierto.
 3. **Capa de Control de Protocolo**: Gestiona la señalización formal de la comunicación RTSP (DESCRIBE, SETUP, PLAY, TEARDOWN) y el multiplexado de los paquetes de datos RTP/RTCP tanto por UDP como por TCP.
-
----
-
-## Requisitos previos
-
-### Hardware requerido
-* **Cámara Intel RealSense D435** conectada a la máquina emisora.
-* **Puerto y Cable USB 3.0**: Es estrictamente necesario conectar la cámara a un puerto USB 3.0 nativo (color azul o con etiqueta SS). Los puertos USB 2.0 limitan severamente el ancho de banda, lo que causará fallos de inicialización al solicitar transmisiones HD y sub-HD simultáneas.
-
-### Software necesario
-
-| Requisito | Versión mínima | Cómo verificar | Instalación |
-|-----------|---------------|-----------------|-------------|
-| Python | 3.8+ | `python --version` | [python.org](https://www.python.org/downloads/) |
-| FFmpeg | 4.0+ | (Gestionado automáticamente por `imageio-ffmpeg`) | Se instala automáticamente vía `pip install -r requirements.txt` |
-| SDK Intel RealSense | Drivers básicos | Automático en Windows 10/11 | Conectar el hardware |
-| pip | (incluido con Python) | `pip --version` | — |
-
-> **Nota:** MediaMTX se descarga **automáticamente** la primera vez que ejecutas `emisor.py`. No necesitas instalarlo manualmente.
-
-### Gestión automática de FFmpeg
-
-En este proyecto, **no necesitas instalar FFmpeg manualmente en Windows ni configurar variables de entorno (PATH)**. 
-
-El sistema utiliza la dependencia de Python `imageio-ffmpeg`, la cual descarga e instala automáticamente un binario ejecutable estático de FFmpeg dentro del entorno virtual (`.venv`). Esto asegura un funcionamiento listo para usar ("out of the box") sin intervenciones manuales del usuario.
-
-### Crear entorno virtual e instalar dependencias
-
-Es altamente recomendable usar un entorno virtual de Python. Abre PowerShell y ejecuta:
-
-```powershell
-cd "C:\ruta\al\proyecto"
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
-```
-
-Las dependencias de Python son:
-- **`opencv-python`**: visualización, procesamiento de imágenes (Jet heatmap) y utilidades de OSD.
-- **`numpy`**: operaciones matriciales rápidas para la concatenación del mosaico.
-- **`imageio-ffmpeg`**: proporciona el binario estático de FFmpeg.
-- **`pyrealsense2`**: SDK oficial de Intel para la comunicación de bajo nivel con la cámara RealSense D435.
-
-Para salir del entorno virtual:
-
-```powershell
-deactivate
-```
 
 ---
 
@@ -127,7 +82,57 @@ Una dirección IP (versión 4 / IPv4) es un número de 4 partes separadas por pu
 
 > Nota: cada bloque se llama "octeto" porque es un valor de 8 bits, y 4 octetos suman 32 bits en total.
 
-### ¿Cómo encontrar la dirección IP del emisor?
+---
+
+# 🪟 Windows — Instrucciones
+
+## Requisitos previos (Windows)
+
+### Hardware requerido
+* **Cámara Intel RealSense D435** conectada a la máquina emisora.
+* **Puerto y Cable USB 3.0**: Es estrictamente necesario conectar la cámara a un puerto USB 3.0 nativo (color azul o con etiqueta SS). Los puertos USB 2.0 limitan severamente el ancho de banda, lo que causará fallos de inicialización al solicitar transmisiones HD y sub-HD simultáneas.
+
+### Software necesario
+
+| Requisito | Versión mínima | Cómo verificar | Instalación |
+|-----------|---------------|-----------------|-------------|
+| Python | 3.8+ | `python --version` | [python.org](https://www.python.org/downloads/) |
+| FFmpeg | 4.0+ | (Gestionado automáticamente por `imageio-ffmpeg`) | Se instala automáticamente vía `pip install -r requirements.txt` |
+| SDK Intel RealSense | Drivers básicos | Automático en Windows 10/11 | Conectar el hardware |
+| pip | (incluido con Python) | `pip --version` | — |
+
+> **Nota:** MediaMTX se descarga **automáticamente** la primera vez que ejecutas `emisor.py`. No necesitas instalarlo manualmente.
+
+### Gestión automática de FFmpeg
+
+En este proyecto, **no necesitas instalar FFmpeg manualmente en Windows ni configurar variables de entorno (PATH)**. 
+
+El sistema utiliza la dependencia de Python `imageio-ffmpeg`, la cual descarga e instala automáticamente un binario ejecutable estático de FFmpeg dentro del entorno virtual (`.venv`). Esto asegura un funcionamiento listo para usar ("out of the box") sin intervenciones manuales del usuario.
+
+### Crear entorno virtual e instalar dependencias (Windows)
+
+Es altamente recomendable usar un entorno virtual de Python. Abre PowerShell y ejecuta:
+
+```powershell
+cd "C:\ruta\al\proyecto"
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+```
+
+Las dependencias de Python son:
+- **`opencv-python`**: visualización, procesamiento de imágenes (Jet heatmap) y utilidades de OSD.
+- **`numpy`**: operaciones matriciales rápidas para la concatenación del mosaico.
+- **`imageio-ffmpeg`**: proporciona el binario estático de FFmpeg.
+- **`pyrealsense2`**: SDK oficial de Intel para la comunicación de bajo nivel con la cámara RealSense D435.
+
+Para salir del entorno virtual:
+
+```powershell
+deactivate
+```
+
+### ¿Cómo encontrar la dirección IP del emisor? (Windows)
 
 En la máquina donde está el **emisor** (la que tiene la cámara), abre PowerShell y ejecuta:
 
@@ -151,7 +156,7 @@ Adaptador de Ethernet:
 - Si está conectada por **cable Ethernet**, busca bajo esa sección.
 - El número que ves **cambia solo si reinicias la computadora o desconectas de la red**. Normalmente es el mismo cada vez.
 
-### Verificar que ambas máquinas están en la misma red
+### Verificar que ambas máquinas están en la misma red (Windows)
 
 Para que el receptor pueda encontrar al emisor, **ambas máquinas deben estar en la misma red local (WiFi o cable)**. Usa este comando en el **receptor** para verificar que ve al emisor:
 
@@ -168,9 +173,7 @@ Si ves `Timed out` o `no se alcanzó el host`, significa que las máquinas no se
 2. Comprueba que estás usando la IP correcta del emisor.
 3. Desactiva el firewall de Windows temporalmente para probar.
 
----
-
-## Cómo ejecutar
+## Cómo ejecutar (Windows)
 
 ### Paso 1: Encuentra la IP del emisor
 
@@ -283,7 +286,7 @@ python receptor.py --sin-hud IP             # Sin overlay de información
 - **Receptor:** presiona `q` en la ventana del vídeo, o `Ctrl+C` en la terminal.
 - **Emisor:** presiona `Ctrl+C` en PowerShell. Esto detiene FFmpeg, MediaMTX y libera la cámara automáticamente.
 
-### Verificar con VLC (opcional)
+### Verificar con VLC (opcional — Windows)
 
 Puedes probar el flujo RTSP con cualquier reproductor compatible. En VLC:
 
@@ -294,37 +297,368 @@ Puedes probar el flujo RTSP con cualquier reproductor compatible. En VLC:
 
 ---
 
-## Resolución de problemas comunes
+# 🐧 Ubuntu/Linux Nativo — Instrucciones (v2)
 
-### "FFmpeg no está instalado o no se encuentra"
+Esta es la versión actual y recomendada para Ubuntu/Linux. Diseñada desde cero para funcionar de forma nativa (no es un calco de Windows).
 
-**Causa:** El entorno virtual no se activó correctamente o no se han instalado las dependencias de Python.
+## Requisitos previos (Ubuntu)
 
-**Solución:**
-1. Asegúrate de activar el entorno virtual con `.\.venv\Scripts\Activate.ps1`.
-2. Asegúrate de ejecutar `pip install -r requirements.txt` para instalar `imageio-ffmpeg` y el resto de dependencias.
+### Hardware
+* **Cámara Intel RealSense D435** conectada por **USB 3.0** (puerto azul).
 
-### "No se pudo abrir la cámara"
+### Software del sistema
 
-**Solución:**
-1. Asegúrate de que la cámara esté conectada y no en uso por otro programa (Zoom, Teams, etc.)
-2. Lista las cámaras disponibles:
-   ```powershell
-   python emisor.py
-   ```
-   *(Anota la URL RTSP y la IP que aparece en la consola).*
-3. **Ejecutar el Receptor:**
-   Abre otro PowerShell (o en otra computadora de tu red) y ejecuta:
-   ```powershell
-   python receptor.py 127.0.0.1  # Usa la IP real si es en otra computadora
-   ```
+Instala las dependencias del sistema operativo:
+
+```bash
+sudo apt update
+sudo apt install -y python3-venv python3-pip ffmpeg libgl1 libglib2.0-0
+```
+
+| Requisito | Cómo verificar | Instalación |
+|-----------|---------------|-------------|
+| Python 3.8+ | `python3 --version` | Incluido en Ubuntu |
+| FFmpeg | `ffmpeg -version` | `sudo apt install ffmpeg` |
+| pip | `pip3 --version` | `sudo apt install python3-pip` |
+| libGL (OpenCV) | — | `sudo apt install libgl1 libglib2.0-0` |
+
+### Instalar pyrealsense2 en Ubuntu
+
+`pyrealsense2` se puede instalar de dos formas:
+
+**Opción A — vía pip (más simple, puede no funcionar en todas las distribuciones):**
+```bash
+pip install pyrealsense2
+```
+
+**Opción B — vía el repositorio oficial de Intel (recomendado si pip falla):**
+```bash
+sudo mkdir -p /etc/apt/keyrings
+curl -sSf https://librealsense.intel.com/Debian/librealsense.pgp \
+  | sudo tee /etc/apt/keyrings/librealsense.pgp > /dev/null
+
+echo "deb [signed-by=/etc/apt/keyrings/librealsense.pgp] \
+  https://librealsense.intel.com/Debian/apt-repo $(lsb_release -cs) main" \
+  | sudo tee /etc/apt/sources.list.d/librealsense.list
+
+sudo apt update
+sudo apt install -y librealsense2-dkms librealsense2-utils librealsense2-dev
+pip install pyrealsense2
+```
+
+### Configurar permisos USB (reglas udev)
+
+**Solo la primera vez.** Sin estas reglas, la cámara puede no abrirse sin `sudo`:
+
+```bash
+wget https://raw.githubusercontent.com/IntelRealSense/librealsense/master/config/99-realsense-libusb.rules
+sudo cp 99-realsense-libusb.rules /etc/udev/rules.d/
+sudo udevadm control --reload-rules && sudo udevadm trigger
+```
+
+Después de esto, **desconecta y reconecta** la cámara.
+
+### Crear entorno virtual e instalar dependencias (Ubuntu)
+
+```bash
+cd /ruta/al/proyecto
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements_ubuntu.txt
+```
+
+Para salir del entorno virtual:
+
+```bash
+deactivate
+```
+
+### Diagnóstico del sistema (Ubuntu)
+
+Si tienes problemas, ejecuta el diagnóstico integrado:
+
+```bash
+python3 emisor_ubuntu.py --diagnostico
+```
+
+Esto verificará: FFmpeg, OpenCV, NumPy, pyrealsense2, reglas udev, dispositivos USB, puertos disponibles y MediaMTX.
+
+## Cómo ejecutar (Ubuntu)
+
+### ¿Cómo encontrar la IP del emisor? (Ubuntu)
+
+```bash
+ip addr show | grep "inet " | grep -v 127.0.0.1
+```
+
+O de forma más legible:
+
+```bash
+hostname -I
+```
+
+Busca la IP que empiece con `192.168.x.x` o `10.x.x.x`.
+
+### Verificar conectividad
+
+Desde la máquina receptora:
+
+```bash
+ping 192.168.1.42    # Reemplaza con la IP del emisor
+```
+
+### Paso 1: Ejecutar el emisor (máquina con la cámara)
+
+```bash
+cd /ruta/al/proyecto
+source .venv/bin/activate
+python3 emisor_ubuntu.py
+```
+
+Deberías ver:
+
+```
+══════════════════════════════════════════════════════════════
+  EMISOR RTSP — Intel RealSense D435 · Ubuntu Nativo (v2)
+══════════════════════════════════════════════════════════════
+
+[1/5] Buscando FFmpeg ...
+  ✓ FFmpeg: /usr/bin/ffmpeg
+    Origen: sistema (ffmpeg version 6.1.1-3ubuntu5)
+
+[2/5] Verificando dependencias Python ...
+  ✓ OpenCV 4.x.x
+  ✓ NumPy 1.x.x
+  ✓ pyrealsense2 disponible
+  ✓ Reglas udev: /etc/udev/rules.d/99-realsense-libusb.rules
+
+[3/5] Preparando servidor RTSP (MediaMTX) ...
+  ✓ MediaMTX corriendo (PID 12345)
+
+[4/5] Abriendo cámara Intel RealSense (índice 0) ...
+  → Dispositivo: Intel RealSense D435 (S/N: 123456789)
+  ✓ Pipeline iniciado (Color 1920×1080, Depth/IR 1280×720 @ 30fps)
+
+[5/5] Iniciando transmisión de 4 canales RTSP ...
+  → color  1920×1080 @ 1100kbps → rtsp://127.0.0.1:8554/color
+  → depth  1280×720  @ 500kbps  → rtsp://127.0.0.1:8554/depth
+  → ir1    1280×720  @ 200kbps  → rtsp://127.0.0.1:8554/ir1
+  → ir2    1280×720  @ 200kbps  → rtsp://127.0.0.1:8554/ir2
+  ✓ Transmisión RTSP activa para los 4 canales
+
+══════════════════════════════════════════════════════════════
+  ✓ TRANSMISIÓN ACTIVA — 4 Canales RTSP
+──────────────────────────────────────────────────────────────
+  Color (RGB):     rtsp://192.168.1.42:8554/color
+  Profundidad:     rtsp://192.168.1.42:8554/depth
+  Infrarrojo 1:    rtsp://192.168.1.42:8554/ir1
+  Infrarrojo 2:    rtsp://192.168.1.42:8554/ir2
+──────────────────────────────────────────────────────────────
+  Receptor:  python3 receptor_ubuntu.py 192.168.1.42
+  VLC:       vlc rtsp://192.168.1.42:8554/color
+══════════════════════════════════════════════════════════════
+
+  Presiona Ctrl+C para detener.
+```
+
+**Opciones del emisor:**
+
+```bash
+python3 emisor_ubuntu.py --puerto 8554       # Puerto RTSP (defecto: 8554)
+python3 emisor_ubuntu.py --cam 1             # Segunda cámara
+python3 emisor_ubuntu.py --calidad 4000      # Mayor calidad (kbps)
+python3 emisor_ubuntu.py --listar-camaras    # Ver cámaras RealSense
+python3 emisor_ubuntu.py --diagnostico       # Diagnóstico completo
+```
+
+### Paso 2: Ejecutar el receptor (otra máquina o terminal)
+
+En la máquina receptora (o en otra terminal):
+
+```bash
+cd /ruta/al/proyecto
+source .venv/bin/activate
+python3 receptor_ubuntu.py 192.168.1.42
+```
+
+El receptor se conectará a los 4 canales y mostrará un mosaico interactivo:
+
+```
+══════════════════════════════════════════════════════════════
+  RECEPTOR RTSP — RealSense D435 · Ubuntu Nativo (v2)
+══════════════════════════════════════════════════════════════
+  color  → rtsp://192.168.1.42:8554/color
+  depth  → rtsp://192.168.1.42:8554/depth
+  ir1    → rtsp://192.168.1.42:8554/ir1
+  ir2    → rtsp://192.168.1.42:8554/ir2
+──────────────────────────────────────────────────────────────
+  Controles: [M]osaico [1]Color [2]IR1 [3]Depth [4]IR2
+             [H]UD on/off  [F]ullscreen  [Q]Salir
+══════════════════════════════════════════════════════════════
+```
+
+**Controles de teclado del receptor:**
+
+| Tecla | Acción |
+|-------|--------|
+| `M` | Vista Mosaico (4 cámaras combinadas) |
+| `1` | Solo canal Color (RGB 1920×1080) |
+| `2` | Solo canal Infrarrojo 1 (Left) |
+| `3` | Solo canal Profundidad (Depth heatmap) |
+| `4` | Solo canal Infrarrojo 2 (Right) |
+| `H` | Mostrar/ocultar HUD (información en pantalla) |
+| `F` | Pantalla completa on/off |
+| `Q` / `ESC` | Salir |
+
+**Opciones del receptor:**
+
+```bash
+python3 receptor_ubuntu.py 192.168.1.42             # IP con puerto defecto (8554)
+python3 receptor_ubuntu.py 192.168.1.42 9554        # Puerto personalizado
+python3 receptor_ubuntu.py rtsp://IP:PUERTO/color   # URL RTSP completa
+python3 receptor_ubuntu.py --sin-hud 192.168.1.42   # Sin overlay de info
+python3 receptor_ubuntu.py 127.0.0.1                # Prueba local
+```
+
+### Paso 3: Detener
+
+- **Receptor:** presiona `Q` o `ESC` en la ventana, o `Ctrl+C` en la terminal.
+- **Emisor:** presiona `Ctrl+C` en la terminal. Libera cámara, FFmpeg y MediaMTX automáticamente.
+
+### Verificar con VLC (opcional — Ubuntu)
+
+```bash
+vlc rtsp://192.168.1.42:8554/color
+```
+
+O desde la interfaz gráfica: **Medio → Abrir ubicación de red** → `rtsp://192.168.1.42:8554/color`
 
 ---
 
-### Opción B: Ejecutar en Ubuntu Nativo (Raspberry Pi, Jetson, PC)
-En un sistema Linux nativo, el kernel ya incluye los controladores de video necesarios.
+# 📡 Ejecutar el receptor en OTRA computadora
 
-1. **Clonar e instalar dependencias:**
+El protocolo RTSP está diseñado para redes. Para ver la cámara desde otra computadora física conectada al mismo WiFi o cable:
+
+1. Descubre la IP de la computadora que tiene la cámara conectada:
+   - **Windows:** abre PowerShell → `ipconfig` → busca Dirección IPv4
+   - **Ubuntu:** `hostname -I` o `ip addr show`
+2. Ve a la **segunda computadora** (la que va a recibir el video), abre la terminal, activa el entorno y ejecuta el script apuntando a esa IP.
+
+**Si el receptor es Windows:**
+```powershell
+cd "C:\ruta\al\proyecto"
+.\.venv\Scripts\Activate.ps1
+python receptor.py 192.168.1.42
+```
+
+**Si el receptor es Ubuntu/Linux:**
+```bash
+cd /ruta/al/proyecto
+source .venv/bin/activate
+python3 receptor_ubuntu.py 192.168.1.42
+```
+
+---
+
+# 🛠️ Resolución de Problemas
+
+### "FFmpeg no está instalado o no se encuentra"
+
+**En Windows:**
+1. Asegúrate de activar el entorno virtual con `.\.venv\Scripts\Activate.ps1`.
+2. Ejecuta `pip install -r requirements.txt` para instalar `imageio-ffmpeg`.
+
+**En Ubuntu:**
+1. Instala FFmpeg del sistema: `sudo apt install ffmpeg`
+2. Verifica: `ffmpeg -version`
+
+### "No se pudo abrir la cámara" / "No se detectaron cámaras"
+
+1. Verifica que la cámara esté conectada a un **puerto USB 3.0** (azul).
+2. Cierra cualquier otro programa que use la cámara (Zoom, Teams, OBS).
+3. **En Ubuntu**, verifica permisos:
+   ```bash
+   python3 emisor_ubuntu.py --diagnostico
+   ls -la /dev/video*
+   ```
+4. Si falta acceso USB, instala las reglas udev (ver sección de requisitos Ubuntu).
+
+### "MediaMTX terminó inesperadamente"
+
+El puerto `8554` ya está en uso:
+```bash
+# Ubuntu:
+sudo lsof -i :8554
+# Usar otro puerto:
+python3 emisor_ubuntu.py --puerto 9554
+```
+
+```powershell
+# Windows:
+netstat -ano | findstr 8554
+python emisor.py --puerto 9554
+```
+
+### "Video lento o entrecortado"
+
+- Reduce la calidad: `python3 emisor_ubuntu.py --calidad 1000`
+- Usa WiFi 5GHz o cable Ethernet.
+- Verifica que ambas máquinas estén en la misma red.
+
+---
+
+# ⚙️ Explicación Técnica Detallada
+
+1. **Multiplexado con MediaMTX**: El emisor envía el video **una sola vez** al servidor local. MediaMTX se encarga de retransmitirlo a todos los receptores (clientes) que se conecten, evitando saturar el hardware de la cámara.
+2. **Procesamiento de Imágenes**: 
+   - La profundidad se convierte a un mapa de calor usando `cv2.COLORMAP_JET`.
+   - Las resoluciones nativas (RGB 1080p y Depth/IR 720p) se redimensionan y concatenan matemáticamente usando `numpy` en un lienzo de `1920x1440`.
+3. **Compresión H.264 (FFmpeg)**: El lienzo en crudo pasa por una tubería (pipe) hacia FFmpeg, configurado con el preset `ultrafast` y `zerolatency` para empujar los paquetes vía RTP/TCP.
+
+---
+
+# 📁 Estructura del proyecto
+
+```text
+Demo RTSP/
+├── emisor.py                  # Emisor para Windows nativo
+├── emisor_ubuntu.py           # Emisor para Ubuntu nativo (v2 — versión actual)
+├── receptor.py                # Receptor para Windows nativo
+├── receptor_ubuntu.py         # Receptor para Ubuntu nativo (v2 — versión actual)
+├── requirements.txt           # Dependencias Python (Windows)
+├── requirements_ubuntu.txt    # Dependencias Python (Ubuntu)
+├── install_realsense.sh       # Script de compilación USB para WSL (legacy)
+├── emisor_ubuntu_v1.py        # ⚠ Emisor Ubuntu v1 (OBSOLETO)
+├── receptor_ubuntu_v1.py      # ⚠ Receptor Ubuntu v1 (OBSOLETO)
+├── mediamtx/                  # Binario MediaMTX para Windows (auto-descargado)
+├── mediamtx_linux/            # Binario MediaMTX para Linux (auto-descargado)
+└── .venv/                     # Entorno virtual de Python
+```
+
+---
+
+# 📜 Versiones anteriores (OBSOLETAS)
+
+> **⚠ Las siguientes versiones están obsoletas y ya no se mantienen.** Se preservan en el repositorio como referencia histórica. Usa las versiones actuales (`emisor_ubuntu.py` v2 y `receptor_ubuntu.py` v2) para Ubuntu/Linux.
+
+## v1 — Emisor/Receptor Ubuntu (OBSOLETO)
+
+**Archivos:** `emisor_ubuntu_v1.py`, `receptor_ubuntu_v1.py`
+
+**Motivo de obsolescencia:** Eran un calco directo de las versiones de Windows con cambios cosméticos mínimos (`.exe` → binario Linux, `zipfile` → `tarfile`). No funcionaban correctamente en Ubuntu nativo por:
+- Dependencia en `imageio-ffmpeg` en lugar del FFmpeg del sistema
+- Sin validación de permisos USB ni reglas udev
+- Sin detección del backend gráfico de OpenCV
+- Sin manejo de señales POSIX
+
+### Instrucciones de la v1 (NO usar — solo referencia)
+
+<details>
+<summary>Click para ver las instrucciones obsoletas de la v1</summary>
+
+#### Ejecutar en Ubuntu Nativo (v1 — OBSOLETO)
+
+1. **Instalar dependencias:**
    ```bash
    sudo apt update && sudo apt install python3-venv python3-pip libgl1 libglib2.0-0
    python3 -m venv .venv
@@ -337,24 +671,27 @@ En un sistema Linux nativo, el kernel ya incluye los controladores de video nece
    sudo cp 99-realsense-libusb.rules /etc/udev/rules.d/
    sudo udevadm control --reload-rules && sudo udevadm trigger
    ```
-3. **Ejecutar el Emisor:**
-   Abre una terminal y ejecuta:
+3. **Ejecutar el Emisor v1:**
    ```bash
    cd /ruta/al/proyecto
    source .venv/bin/activate
-   python3 emisor_ubuntu.py
+   python3 emisor_ubuntu_v1.py
    ```
-4. **Ejecutar el Receptor:**
-   En otra terminal o en otra computadora, ejecuta:
+4. **Ejecutar el Receptor v1:**
    ```bash
    cd /ruta/al/proyecto
    source .venv/bin/activate
-   python3 receptor_ubuntu.py 127.0.0.1  # Usa la IP real si es en otra computadora
+   python3 receptor_ubuntu_v1.py 127.0.0.1
    ```
+
+</details>
 
 ---
 
-### Opción C: Ejecutar en WSL2 (Desarrollo avanzado)
+## WSL2 — Ejecutar en WSL2 (Desarrollo avanzado)
+
+> **Nota:** Esta opción es para desarrollo avanzado. Para producción, se recomienda Ubuntu nativo.
+
 WSL2 no tiene drivers de video USB. Requiere puentear el USB desde Windows y compilar una librería especial. Sigue estos 6 pasos exactos:
 
 **Paso 1: Vincular la cámara a WSL**
@@ -401,58 +738,4 @@ En PowerShell como Administrador:
 usbipd detach --busid <TU_BUSID>
 usbipd unbind --busid <TU_BUSID>
 # Para borrar el programa si ya no lo usas: winget uninstall dorssel.usbipd-win
-```
-
----
-
-## 📡 Ejecutar el receptor en OTRA computadora
-El protocolo RTSP está diseñado para redes. Para ver la cámara desde otra computadora física conectada al mismo WiFi o cable:
-
-1. Descubre la IP de la computadora que tiene la cámara conectada (En Windows abre PowerShell y escribe `ipconfig` -> busca Dirección IPv4, ej: `192.168.1.42`).
-2. Ve a la **segunda computadora** (la que va a recibir el video), abre la terminal, activa el entorno y ejecuta el script apuntando a esa IP.
-
-**Si el receptor es Windows:**
-```powershell
-cd "C:\ruta\al\proyecto"
-.\venv\Scripts\Activate.ps1
-python receptor.py 192.168.1.42
-```
-
-**Si el receptor es Ubuntu/Linux:**
-```bash
-cd /ruta/al/proyecto
-source .venv/bin/activate
-python3 receptor_ubuntu.py 192.168.1.42
-```
-
-*(Nota: Si usas el emisor dentro de WSL, Windows bloqueará la conexión a otras computadoras físicas. Para transmitir a otra PC, es altamente recomendado usar el emisor en Windows Nativo u Ubuntu Nativo).*
-
----
-
-## 🛠️ Resolución de Problemas
-
-- **"No se detectaron cámaras"**: Asegúrate de que no haya otro programa usando la cámara (Zoom, OBS). En WSL, verifica que hayas hecho el `usbipd attach`.
-- **"MediaMTX terminó inesperadamente"**: El puerto `8554` ya está en uso. Usa `python emisor.py --puerto 9554` y conéctate con `python receptor.py <IP> 9554`.
-- **"Video lento o entrecortado"**: Reduce la calidad con `python emisor.py --calidad 1000`. Usa WiFi 5GHz o cable Ethernet.
-
----
-
-## ⚙️ Explicación Técnica Detallada
-
-1. **Multiplexado con MediaMTX**: El emisor envía el video **una sola vez** al servidor local. MediaMTX se encarga de retransmitirlo a todos los receptores (clientes) que se conecten, evitando saturar el hardware de la cámara.
-2. **Procesamiento de Imágenes**: 
-   - La profundidad se convierte a un mapa de calor usando `cv2.COLORMAP_JET`.
-   - Las resoluciones nativas (RGB 1080p y Depth/IR 720p) se redimensionan y concatenan matemáticamente usando `numpy` en un lienzo de `1920x1440`.
-3. **Compresión H.264 (FFmpeg)**: El lienzo en crudo pasa por una tubería (pipe) hacia FFmpeg, configurado con el preset `ultrafast` y `zerolatency` para empujar los paquetes vía RTP/TCP.
-
-### Estructura del proyecto
-```text
-Demo RTSP/
-├── emisor.py              # Emisor para Windows nativo
-├── emisor_ubuntu.py       # Emisor para Linux/WSL
-├── receptor.py            # Receptor para Windows nativo
-├── receptor_ubuntu.py     # Receptor para Linux/WSL
-├── install_realsense.sh   # Script de compilación USB para WSL
-├── requirements.txt       # Dependencias de Python (opencv-python, numpy, etc.)
-└── .venv/                 # Entorno virtual de Python
 ```
