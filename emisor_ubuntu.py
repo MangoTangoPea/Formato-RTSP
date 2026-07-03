@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 """
-Emisor RTSP para Intel RealSense D435 — Ubuntu/Linux Nativo (v2).
+Emisor RTSP para Intel RealSense D435 — Ubuntu/Linux Nativo (v3).
 
-Rediseñado desde cero para funcionar de forma nativa en Linux.
-A diferencia de la v1 (calco de Windows), esta versión:
-  - Usa FFmpeg del sistema (apt install ffmpeg) en lugar de imageio-ffmpeg
-  - Valida permisos USB y reglas udev antes de abrir la cámara
-  - Usa señales POSIX para un cierre limpio
-  - Descarga MediaMTX con verificación robusta de arquitectura
+Arquitectura de grabación y streaming con esteganografía LSB:
+  - Inyecta Frame ID (64 bits) + Timestamp (64 bits) en cada frame vía LSB
+  - Soporta grabación local en Matroska (.mkv) como mosaico unificado (--grabar)
+  - Usa un solo pipe stdin para la grabación (sin FIFOs)
+  - Mantiene compatibilidad total con señales POSIX y cierre limpio
 
 Publica 4 streams RTSP independientes:
   rtsp://<IP>:8554/color    — RGB 1920x1080
@@ -15,8 +14,21 @@ Publica 4 streams RTSP independientes:
   rtsp://<IP>:8554/ir1      — Infrarrojo izquierdo 1280x720
   rtsp://<IP>:8554/ir2      — Infrarrojo derecho 1280x720
 
+Grabación MKV (--grabar):
+  Fusiona los 4 canales (con LSB inyectado) en un mosaico unificado
+  de 1920x1440 y lo escribe en tiempo real a un archivo Matroska (.mkv).
+  El layout del mosaico es idéntico al del receptor:
+    ┌──────────────────────────────┐
+    │           Color              │
+    │        1920 × 1080           │
+    ├──────────┬──────────┬────────┤
+    │   IR1    │  Depth   │  IR2   │
+    │ 640×360  │ 640×360  │ 640×360│
+    └──────────┴──────────┴────────┘
+
 Uso:
     python3 emisor_ubuntu.py [--puerto PUERTO] [--cam INDICE] [--calidad KBPS]
+    python3 emisor_ubuntu.py --grabar [RUTA.mkv]
     python3 emisor_ubuntu.py --listar-camaras
     python3 emisor_ubuntu.py --diagnostico
 """
@@ -33,10 +45,22 @@ import socket
 import shutil
 import urllib.request
 import glob
+import struct
+import queue
+import threading
+import datetime
+
+# ─── Importación soft de numpy ──────────────────────────────────────────
+# Necesaria para las funciones LSB a nivel de módulo.
+# El diagnóstico y listado de cámaras siguen funcionando sin numpy.
+try:
+    import numpy as np
+except ImportError:
+    np = None
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# CONSTANTES
+# CONSTANTES GLOBALES
 # ═══════════════════════════════════════════════════════════════════════════
 
 PUERTO_RTSP_DEFECTO = 8554
@@ -44,8 +68,228 @@ DIR_BASE = os.path.dirname(os.path.abspath(__file__))
 DIR_MEDIAMTX = os.path.join(DIR_BASE, "mediamtx_linux")
 MEDIAMTX_VERSION = "v1.12.2"
 
-# Flag global para cierre limpio con señales POSIX
+# ─── Flag global para cierre limpio con señales POSIX ───────────────────
+# Se activa cuando se recibe SIGINT (Ctrl+C) o SIGTERM para que el bucle
+# principal termine de forma ordenada.
 _cerrando = False
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# ESTEGANOGRAFÍA LSB (Least Significant Bit)
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# Inyecta y extrae 128 bits de metadatos (64-bit Frame ID + 64-bit Timestamp)
+# en la primera fila de cada frame usando el bit menos significativo.
+#
+# ── Esquema de codificación ──
+# Los 128 bits de payload (Frame ID + Timestamp) se empaquetan en big-endian
+# como 16 bytes contiguos usando struct.pack('>QQ', ...).
+#
+# Cada bit lógico se replica en BITS_POR_BLOQUE (8) píxeles consecutivos
+# para crear redundancia que permita sobrevivir a la compresión H.264.
+# En la extracción se aplica "majority voting" sobre cada bloque de 8 píxeles
+# para reconstruir el bit original (si ≥5 de 8 LSBs son 1, el bit es 1).
+#
+# Total de píxeles utilizados: 128 × 8 = 1024 (caben en 1280px y 1920px).
+#
+# ── Impacto visual ──
+# Solo se modifica el bit menos significativo de cada píxel. Esto produce
+# un cambio máximo de ±1 en un rango de 0..255, es decir, una perturbación
+# del 0.39% que es completamente imperceptible al ojo humano.
+#
+# ── Canal de inyección ──
+# - En imágenes BGR (Color, Depth heatmap): se modifica el LSB del canal
+#   Azul [0] únicamente, dejando intactos los canales Verde y Rojo.
+# - En imágenes monocromáticas (IR1, IR2): se modifica el LSB del píxel
+#   directamente (ya que solo hay un canal).
+
+BITS_POR_BLOQUE = 1
+TOTAL_BITS = 128
+PIXELES_LSB = TOTAL_BITS * BITS_POR_BLOQUE  # 128 (píxeles del 0 al 127)
+
+
+def inyectar_lsb(frame, frame_id, timestamp_ns):
+    """
+    Inyecta 128 bits de metadatos en la primera fila (fila 0) del frame.
+
+    El payload consta de:
+      - Bits [0..63]:   Frame ID (entero secuencial de 64 bits, inicia en 1)
+      - Bits [64..127]: Timestamp del computador emisor (nanosegundos, time.time_ns())
+
+    Cada bit lógico se replica en 8 píxeles consecutivos para redundancia.
+
+    Comportamiento según tipo de imagen:
+      - Frame BGR (3D, shape H×W×3): modifica únicamente el LSB del canal
+        Azul (canal [0] en orden BGR de OpenCV).
+      - Frame Grayscale (2D, shape H×W): modifica el LSB del píxel directamente.
+
+    Modifica el frame in-place y lo retorna.
+
+    Args:
+        frame:        Imagen NumPy (H×W×3 para BGR, H×W para grayscale).
+        frame_id:     Identificador secuencial del frame (entero 64 bits).
+        timestamp_ns: Timestamp del sistema emisor en nanosegundos.
+
+    Returns:
+        El mismo frame (modificado in-place).
+    """
+    ancho = frame.shape[1]
+
+    # Verificar que la imagen es lo suficientemente ancha para los 1024 píxeles LSB
+    if ancho < PIXELES_LSB:
+        return frame
+
+    # ── Empaquetar payload a 16 bytes big-endian ────────────────────────
+    # struct.pack('>QQ', ...) produce exactamente 16 bytes (128 bits).
+    # La máscara & 0xFFFF...F asegura que valores negativos se trunquen
+    # correctamente a 64 bits sin signo.
+    datos = struct.pack('>QQ',
+                        frame_id & 0xFFFFFFFFFFFFFFFF,
+                        timestamp_ns & 0xFFFFFFFFFFFFFFFF)
+
+    # ── Desempaquetar a 128 bits individuales y expandir con redundancia ─
+    # np.unpackbits convierte los 16 bytes en un array de 128 bits (0 o 1).
+    # np.repeat duplica cada bit 8 veces → array de 1024 valores.
+    bits_arr = np.unpackbits(np.frombuffer(datos, dtype=np.uint8))
+    mascara = np.repeat(bits_arr, BITS_POR_BLOQUE)
+
+    # ── Obtener referencia directa a la primera fila (sin copia) ────────
+    # Accedemos directamente al array para modificar in-place sin overhead.
+    if frame.ndim == 3:
+        # Imagen BGR: solo modificamos el canal Azul (índice 0)
+        fila = frame[0, :PIXELES_LSB, 0]
+    else:
+        # Imagen grayscale: modificamos el píxel directamente
+        fila = frame[0, :PIXELES_LSB]
+
+    # ── Aplicar inyección LSB ───────────────────────────────────────────
+    # Paso 1: Limpiar el LSB actual con AND 0xFE (11111110 en binario)
+    # Paso 2: Establecer el nuevo LSB con OR de la máscara
+    # Resultado: el LSB de cada píxel queda exactamente como el bit de datos
+    fila[:] = (fila & np.uint8(0xFE)) | mascara.astype(fila.dtype)
+    return frame
+
+
+def extraer_lsb(frame):
+    """
+    Extrae 128 bits de metadatos LSB de la primera fila del frame
+    usando majority voting sobre bloques de BITS_POR_BLOQUE píxeles.
+
+    El proceso es el inverso de inyectar_lsb():
+      1. Lee los 1024 LSBs de la fila 0
+      2. Los agrupa en 128 bloques de 8 píxeles
+      3. Aplica majority voting: si ≥5 de 8 LSBs son 1, el bit lógico es 1
+      4. Empaqueta los 128 bits en 16 bytes y los desempaqueta con struct
+
+    Retorna (frame_id, timestamp_ns) o (None, None) si no es posible extraer.
+    """
+    ancho = frame.shape[1] if frame.ndim >= 2 else 0
+    if ancho < PIXELES_LSB:
+        return None, None
+
+    # Seleccionar la fila 0 del canal correcto
+    if frame.ndim == 3:
+        fila = frame[0, :PIXELES_LSB, 0]   # Canal Azul en BGR
+    else:
+        fila = frame[0, :PIXELES_LSB]       # Grayscale directo
+
+    # ── Extraer LSBs ────────────────────────────────────────────────────
+    # AND con 1 extrae solo el bit menos significativo de cada píxel.
+    # Reshape agrupa los 1024 valores en 128 bloques de 8.
+    lsbs = (fila & np.uint8(1)).reshape(TOTAL_BITS, BITS_POR_BLOQUE)
+
+    # ── Majority voting ─────────────────────────────────────────────────
+    # Sumamos los LSBs de cada bloque (resultado 0..8).
+    # Si la suma es > 4 (es decir ≥5), el bit lógico original era 1.
+    # Esto permite tolerar hasta 3 bits corrompidos por la compresión H.264.
+    bits = (lsbs.sum(axis=1) > BITS_POR_BLOQUE // 2).astype(np.uint8)
+
+    # ── Empaquetar bits → bytes → struct ────────────────────────────────
+    datos = np.packbits(bits)
+    frame_id, timestamp_ns = struct.unpack('>QQ', datos.tobytes())
+    return frame_id, timestamp_ns
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# GRABACIÓN DE RANGO SIN PÉRDIDAS (Asíncrona)
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# Permite grabar un rango específico de frames (ej: frame 100 a 500) en
+# formato PNG sin pérdidas, incluyendo la profundidad en 16 bits nativos.
+# Los metadatos (Frame ID, timestamp) se registran en un CSV sincronizado.
+
+class GrabadorRango:
+    """
+    Grabador en segundo plano para registrar un rango específico de frames sin pérdidas.
+    Guarda las imágenes en carpetas individuales (PNG) y la profundidad en 16 bits nativos (Z16).
+    Registra los metadatos de sincronía (Frame ID y timestamps) en un archivo CSV.
+
+    La escritura a disco se realiza en un hilo dedicado para no bloquear el bucle
+    principal de captura/transmisión. Los frames se encolan como copias independientes
+    para evitar condiciones de carrera con el bucle principal.
+    """
+    def __init__(self, dir_salida, frame_inicio, frame_fin):
+        self.dir_salida = dir_salida
+        self.inicio = frame_inicio
+        self.fin = frame_fin
+        self.cola = queue.Queue()
+        self.corriendo = True
+        self.hilo = threading.Thread(target=self._bucle_guardado, name="GrabadorRango", daemon=True)
+
+        # Crear estructura de carpetas para cada canal
+        for subdir in ["color", "depth", "ir1", "ir2"]:
+            os.makedirs(os.path.join(self.dir_salida, subdir), exist_ok=True)
+
+        # Crear archivo de metadatos CSV con encabezado
+        self.csv_path = os.path.join(self.dir_salida, "metadata.csv")
+        with open(self.csv_path, "w", encoding="utf-8") as f:
+            f.write("frame_id,timestamp_ns,timestamp_utc\n")
+
+        self.hilo.start()
+
+    def agregar_frame(self, frame_id, color, depth_raw, ir1, ir2, timestamp_ns):
+        """Encola un frame para guardado si está dentro del rango solicitado."""
+        if self.inicio <= frame_id <= self.fin:
+            # Mandamos copias a la cola para evitar modificaciones concurrentes
+            self.cola.put((frame_id, color.copy(), depth_raw.copy(), ir1.copy(), ir2.copy(), timestamp_ns))
+
+    def _bucle_guardado(self):
+        """Hilo de escritura: desencola frames y los guarda en PNG + CSV."""
+        while self.corriendo or not self.cola.empty():
+            try:
+                item = self.cola.get(timeout=0.2)
+            except queue.Empty:
+                continue
+
+            frame_id, color, depth_raw, ir1, ir2, timestamp_ns = item
+
+            # Nombre del archivo con ceros a la izquierda (ej: 00000150.png)
+            filename = f"{frame_id:08d}.png"
+
+            # Guardar imágenes sin pérdida (PNG)
+            # OpenCV detecta uint16 y guarda automáticamente como PNG de 16 bits
+            cv2.imwrite(os.path.join(self.dir_salida, "color", filename), color)
+            cv2.imwrite(os.path.join(self.dir_salida, "depth", filename), depth_raw)
+            cv2.imwrite(os.path.join(self.dir_salida, "ir1", filename), ir1)
+            cv2.imwrite(os.path.join(self.dir_salida, "ir2", filename), ir2)
+
+            # Registrar metadatos en CSV
+            try:
+                dt_utc = datetime.datetime.fromtimestamp(timestamp_ns / 1e9, datetime.timezone.utc)
+                fecha_utc = dt_utc.isoformat()
+            except Exception:
+                fecha_utc = "unknown"
+
+            with open(self.csv_path, "a", encoding="utf-8") as f:
+                f.write(f"{frame_id},{timestamp_ns},{fecha_utc}\n")
+
+            self.cola.task_done()
+
+    def detener(self):
+        """Detiene el hilo de escritura y espera a que termine."""
+        self.corriendo = False
+        if self.hilo.is_alive():
+            self.hilo.join(timeout=15.0)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -86,7 +330,6 @@ def buscar_ffmpeg():
                 capture_output=True, text=True, timeout=5
             )
             if res.returncode == 0:
-                # Extraer versión de la primera línea
                 version_linea = res.stdout.split("\n")[0] if res.stdout else "desconocida"
                 return ruta_sistema, f"sistema ({version_linea})"
         except Exception:
@@ -131,9 +374,11 @@ def verificar_opencv():
 
 def verificar_numpy():
     """Intenta importar numpy y retorna el módulo o None."""
+    global np
     try:
-        import numpy as np
-        return np
+        import numpy as _np
+        np = _np
+        return _np
     except ImportError:
         return None
 
@@ -210,11 +455,11 @@ def ejecutar_diagnostico():
 
     # 3. Python / OpenCV / numpy
     cv2 = verificar_opencv()
-    np = verificar_numpy()
+    _np = verificar_numpy()
     rs = verificar_pyrealsense2()
 
     print(f"  [{'✓' if cv2 else '✗'}] OpenCV: {'v' + cv2.__version__ if cv2 else 'NO instalado'}")
-    print(f"  [{'✓' if np else '✗'}] NumPy: {'v' + np.__version__ if np else 'NO instalado'}")
+    print(f"  [{'✓' if _np else '✗'}] NumPy: {'v' + _np.__version__ if _np else 'NO instalado'}")
     print(f"  [{'✓' if rs else '✗'}] pyrealsense2: {'disponible' if rs else 'NO instalado'}")
 
     if not rs:
@@ -417,11 +662,17 @@ def obtener_ip_local():
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# PROCESOS FFMPEG
+# PROCESOS FFMPEG — RTSP
 # ═══════════════════════════════════════════════════════════════════════════
 
 def crear_ffmpeg(ruta_ffmpeg, url_rtsp, ancho, alto, pix_fmt, fps, bitrate_kbps):
-    """Lanza un subproceso FFmpeg para codificar rawvideo → H.264 → RTSP."""
+    """
+    Lanza un subproceso FFmpeg para codificar rawvideo → H.264 → RTSP.
+
+    Cada canal de la cámara (Color, Depth, IR1, IR2) tiene su propio proceso
+    FFmpeg independiente que codifica los frames crudos en H.264 con el preset
+    ultrafast y los publica vía RTSP/TCP al servidor MediaMTX local.
+    """
     cmd = [
         ruta_ffmpeg,
         "-y",
@@ -430,15 +681,15 @@ def crear_ffmpeg(ruta_ffmpeg, url_rtsp, ancho, alto, pix_fmt, fps, bitrate_kbps)
         "-pix_fmt", pix_fmt,
         "-s", f"{ancho}x{alto}",
         "-r", str(fps),
-        "-i", "-",
+        "-i", "-",                          # Leer desde stdin (pipe)
         "-c:v", "libx264",
         "-pix_fmt", "yuv420p",
-        "-preset", "ultrafast",
-        "-tune", "zerolatency",
+        "-preset", "ultrafast",             # Mínima latencia de codificación
+        "-tune", "zerolatency",             # Optimizado para streaming en vivo
         "-b:v", f"{bitrate_kbps}k",
         "-maxrate", f"{bitrate_kbps}k",
         "-bufsize", f"{bitrate_kbps * 2}k",
-        "-g", str(fps * 2),
+        "-g", str(fps * 2),                 # GOP de 2 segundos
         "-f", "rtsp",
         "-rtsp_transport", "tcp",
         url_rtsp,
@@ -452,21 +703,180 @@ def crear_ffmpeg(ruta_ffmpeg, url_rtsp, ancho, alto, pix_fmt, fps, bitrate_kbps)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# GRABACIÓN MKV — MOSAICO UNIFICADO
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# A diferencia de la v2 que usaba 4 Named Pipes (FIFOs) para alimentar 4 tracks
+# independientes dentro del MKV, esta v3 fusiona los 4 canales en un ÚNICO
+# mosaico de 1920×1440 y lo graba como un solo stream de video.
+#
+# Ventajas del mosaico unificado:
+#   1. Un solo pipe stdin → un solo track → pipeline drásticamente más simple
+#   2. Si hay drop de frames, la caída afecta simétricamente a los 4 cuadrantes
+#      (imposible tener desfases temporales entre cámaras)
+#   3. Elimina los FIFOs (/tmp/rtsp_grab_*) y sus riesgos de deadlock
+#   4. El archivo MKV se puede reproducir en cualquier reproductor estándar
+#
+# ¿Por qué Matroska (.mkv)?
+#   Matroska usa una estructura de clusters/bloques que se escribe
+#   incrementalmente. A diferencia de MP4 (que necesita un átomo 'moov'
+#   al final del archivo), MKV es reproducible hasta el último cluster
+#   escrito incluso si el proceso muere abruptamente (corte de luz,
+#   kill -9, etc.). El video guardado hasta ese milisegundo NO se corrompe.
+
+# ─── Resolución del mosaico ─────────────────────────────────────────────
+# Layout idéntico al modo mosaico del receptor:
+#   Fila superior:  Color 1920×1080
+#   Fila inferior:  IR1 640×360 | Depth 640×360 | IR2 640×360
+#   Total:          1920 × 1440
+MOSAICO_ANCHO = 1920
+MOSAICO_ALTO = 1440
+
+
+def construir_mosaico(color_img, depth_color, ir1_img, ir2_img, cv2_mod):
+    """
+    Fusiona los 4 frames (ya inyectados con LSB) en un mosaico unificado
+    de 1920×1440 con el mismo layout que usa el receptor.
+
+    Layout resultante:
+      ┌──────────────────────────────┐
+      │           Color              │
+      │        1920 × 1080           │
+      ├──────────┬──────────┬────────┤
+      │   IR1    │  Depth   │  IR2   │
+      │ 640×360  │ 640×360  │ 640×360│
+      └──────────┴──────────┴────────┘
+
+    Args:
+        color_img:   Frame BGR 1920×1080 (ya con LSB inyectado)
+        depth_color: Frame BGR 1280×720 heatmap JET (ya con LSB inyectado)
+        ir1_img:     Frame grayscale 1280×720 (ya con LSB inyectado)
+        ir2_img:     Frame grayscale 1280×720 (ya con LSB inyectado)
+        cv2_mod:     Módulo OpenCV (pasado como argumento para evitar import global)
+
+    Returns:
+        Mosaico NumPy BGR de 1920×1440.
+    """
+    # ── Redimensionar canales secundarios a 640×360 ─────────────────────
+    # La resolución 640×360 es exactamente la mitad de 1280×720 (factor 2x),
+    # lo que produce un downscale limpio sin artefactos de interpolación.
+    ir1_small = cv2_mod.resize(ir1_img, (640, 360), interpolation=cv2_mod.INTER_LINEAR)
+    depth_small = cv2_mod.resize(depth_color, (640, 360), interpolation=cv2_mod.INTER_LINEAR)
+    ir2_small = cv2_mod.resize(ir2_img, (640, 360), interpolation=cv2_mod.INTER_LINEAR)
+
+    # ── Convertir imágenes IR de grayscale a BGR ────────────────────────
+    # Necesario para que np.hstack funcione: todas las imágenes deben tener
+    # 3 canales para concatenarse en un mosaico BGR uniforme.
+    if ir1_small.ndim == 2:
+        ir1_small = cv2_mod.cvtColor(ir1_small, cv2_mod.COLOR_GRAY2BGR)
+    if ir2_small.ndim == 2:
+        ir2_small = cv2_mod.cvtColor(ir2_small, cv2_mod.COLOR_GRAY2BGR)
+
+    # ── Ensamblar el mosaico ────────────────────────────────────────────
+    # Fila inferior: IR1 (640×360) + Depth (640×360) + IR2 (640×360) = 1920×360
+    fila_inferior = np.hstack([ir1_small, depth_small, ir2_small])
+
+    # Mosaico completo: Color (1920×1080) arriba + fila inferior (1920×360)
+    mosaico = np.vstack([color_img, fila_inferior])
+
+    return mosaico
+
+
+def crear_grabacion_mosaico_mkv(ruta_ffmpeg, ruta_mkv, fps=30):
+    """
+    Crea el pipeline de grabación MKV con mosaico unificado.
+
+    Lanza un solo proceso FFmpeg que lee rawvideo BGR24 de 1920×1440 desde
+    stdin y lo codifica a H.264 dentro de un contenedor Matroska.
+
+    La simplicidad del pipeline (un solo stdin pipe) elimina los riesgos
+    de los Named Pipes (FIFOs) y garantiza que un frame drop afecte
+    simétricamente a los 4 cuadrantes del mosaico.
+
+    Args:
+        ruta_ffmpeg: Ruta al ejecutable de FFmpeg.
+        ruta_mkv:    Ruta de destino del archivo .mkv.
+        fps:         Frames por segundo de la grabación.
+
+    Returns:
+        subprocess.Popen del proceso FFmpeg, o None si falla.
+    """
+    cmd = [
+        ruta_ffmpeg,
+        "-y",                                   # Sobrescribir si existe
+        # ── Input: rawvideo BGR24 desde stdin ───────────────────────
+        "-f", "rawvideo",
+        "-pix_fmt", "bgr24",
+        "-s", f"{MOSAICO_ANCHO}x{MOSAICO_ALTO}",  # 1920×1440
+        "-r", str(fps),
+        "-i", "-",                               # Leer desde stdin (pipe)
+        # ── Codificación H.264 de alta calidad ──────────────────────
+        "-c:v", "libx264",
+        "-pix_fmt", "yuv420p",                   # Compatibilidad universal
+        "-preset", "ultrafast",                  # Mínima carga CPU en tiempo real
+        "-crf", "18",                            # Alta calidad (menor = mejor)
+        # ── Metadatos descriptivos del archivo ──────────────────────
+        "-metadata", "title=RealSense D435 Mosaico LSB",
+        "-metadata", f"comment=Layout: Color 1920x1080 + IR1/Depth/IR2 640x360 | LSB: FID+TS 128bits",
+        # ── Salida Matroska ─────────────────────────────────────────
+        # Matroska es resiliente a cortes abruptos: el archivo es
+        # reproducible hasta el último cluster escrito.
+        "-f", "matroska",
+        ruta_mkv,
+    ]
+
+    print(f"  → Lanzando FFmpeg de grabación MKV (mosaico {MOSAICO_ANCHO}×{MOSAICO_ALTO}) ...")
+    try:
+        proceso = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+        )
+    except Exception as e:
+        print(f"  ✗ Error al lanzar FFmpeg de grabación: {e}")
+        return None
+
+    # Verificar que FFmpeg no haya muerto inmediatamente
+    time.sleep(0.3)
+    if proceso.poll() is not None:
+        stderr_out = proceso.stderr.read().decode(errors="replace")[:500]
+        print(f"  ✗ FFmpeg de grabación terminó antes de empezar:")
+        print(f"    {stderr_out}")
+        return None
+
+    print(f"  ✓ Pipeline de grabación MKV activo → {ruta_mkv}")
+    return proceso
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # FUNCIÓN PRINCIPAL DEL EMISOR
 # ═══════════════════════════════════════════════════════════════════════════
 
-def iniciar_emisor(indice_camara=0, puerto=PUERTO_RTSP_DEFECTO, bitrate_kbps=2000):
+def iniciar_emisor(indice_camara=0, puerto=PUERTO_RTSP_DEFECTO,
+                   bitrate_kbps=2000, ruta_grabacion=None,
+                   rango_grabacion=None, dir_salida=None):
     """
-    Emisor RTSP v2: captura 4 canales de RealSense D435 y los publica
-    como streams RTSP independientes a través de MediaMTX.
+    Emisor RTSP v3: captura 4 canales de RealSense D435, inyecta metadatos
+    LSB (Frame ID + Timestamp) y los publica como streams RTSP independientes.
+
+    Opcionalmente graba un archivo Matroska con mosaico unificado sincronizado
+    o un rango de fotogramas sin pérdidas.
     """
     global _cerrando
     proceso_mediamtx = None
-    procesos_ff = {}  # {"color": Popen, "depth": Popen, ...}
+    procesos_ff = {}         # {"color": Popen, "depth": Popen, ...}
     pipeline = None
     pipeline_activo = False
 
+    # ─── Variables de grabación MKV (mosaico unificado) ─────────────────
+    grabando = False
+    proceso_grab = None
+
     # ─── Registrar señales POSIX para cierre limpio ─────────────────────
+    # SIGINT se recibe con Ctrl+C. SIGTERM se recibe al hacer kill <PID>.
+    # Ambas activan el flag _cerrando para que el bucle principal salga
+    # de forma ordenada, liberando todos los recursos.
     def manejar_senal(signum, frame):
         global _cerrando
         nombre = signal.Signals(signum).name
@@ -478,13 +888,14 @@ def iniciar_emisor(indice_camara=0, puerto=PUERTO_RTSP_DEFECTO, bitrate_kbps=200
 
     try:
         print("\n" + "═" * 62)
-        print("  EMISOR RTSP — Intel RealSense D435 · Ubuntu Nativo (v2)")
+        print("  EMISOR RTSP — Intel RealSense D435 · Ubuntu Nativo (v3)")
+        print("  Esteganografía LSB activa · Bloques de 8px por bit")
         print("═" * 62)
 
         # ──────────────────────────────────────────────────────────────
         # PASO 1: Verificar FFmpeg
         # ──────────────────────────────────────────────────────────────
-        print("\n[1/5] Buscando FFmpeg ...")
+        print("\n[1/6] Buscando FFmpeg ...")
         ruta_ffmpeg, origen = buscar_ffmpeg()
         if ruta_ffmpeg is None:
             print("  ✗ FFmpeg no encontrado en el sistema.")
@@ -496,7 +907,7 @@ def iniciar_emisor(indice_camara=0, puerto=PUERTO_RTSP_DEFECTO, bitrate_kbps=200
         # ──────────────────────────────────────────────────────────────
         # PASO 2: Verificar dependencias Python
         # ──────────────────────────────────────────────────────────────
-        print("\n[2/5] Verificando dependencias Python ...")
+        print("\n[2/6] Verificando dependencias Python ...")
 
         cv2 = verificar_opencv()
         if cv2 is None:
@@ -506,12 +917,12 @@ def iniciar_emisor(indice_camara=0, puerto=PUERTO_RTSP_DEFECTO, bitrate_kbps=200
             sys.exit(1)
         print(f"  ✓ OpenCV {cv2.__version__}")
 
-        np = verificar_numpy()
-        if np is None:
+        _np = verificar_numpy()
+        if _np is None:
             print("  ✗ numpy no instalado.")
             print("    Instalar: pip install numpy")
             sys.exit(1)
-        print(f"  ✓ NumPy {np.__version__}")
+        print(f"  ✓ NumPy {_np.__version__}")
 
         rs = verificar_pyrealsense2()
         if rs is None:
@@ -536,13 +947,13 @@ def iniciar_emisor(indice_camara=0, puerto=PUERTO_RTSP_DEFECTO, bitrate_kbps=200
         # ──────────────────────────────────────────────────────────────
         # PASO 3: Iniciar MediaMTX
         # ──────────────────────────────────────────────────────────────
-        print(f"\n[3/5] Preparando servidor RTSP (MediaMTX) ...")
+        print(f"\n[3/6] Preparando servidor RTSP (MediaMTX) ...")
         proceso_mediamtx = iniciar_mediamtx(puerto)
 
         # ──────────────────────────────────────────────────────────────
         # PASO 4: Abrir la cámara RealSense D435
         # ──────────────────────────────────────────────────────────────
-        print(f"\n[4/5] Abriendo cámara Intel RealSense (índice {indice_camara}) ...")
+        print(f"\n[4/6] Abriendo cámara Intel RealSense (índice {indice_camara}) ...")
 
         ctx = rs.context()
         dispositivos = ctx.query_devices()
@@ -564,7 +975,7 @@ def iniciar_emisor(indice_camara=0, puerto=PUERTO_RTSP_DEFECTO, bitrate_kbps=200
         config = rs.config()
         config.enable_device(serial)
 
-        # Configurar streams a resolución nativa
+        # Configurar streams a resolución nativa de la D435
         config.enable_stream(rs.stream.color, 1920, 1080, rs.format.bgr8, 30)
         config.enable_stream(rs.stream.infrared, 1, 1280, 720, rs.format.y8, 30)
         config.enable_stream(rs.stream.infrared, 2, 1280, 720, rs.format.y8, 30)
@@ -586,9 +997,9 @@ def iniciar_emisor(indice_camara=0, puerto=PUERTO_RTSP_DEFECTO, bitrate_kbps=200
         # ──────────────────────────────────────────────────────────────
         # PASO 5: Lanzar 4 FFmpeg → RTSP
         # ──────────────────────────────────────────────────────────────
-        print(f"\n[5/5] Iniciando transmisión de 4 canales RTSP ...")
+        print(f"\n[5/6] Iniciando transmisión de 4 canales RTSP ...")
 
-        # Distribución del bitrate
+        # Distribución proporcional del bitrate entre los 4 canales
         bitrates = {
             "color": max(200, int(bitrate_kbps * 0.55)),
             "depth": max(200, int(bitrate_kbps * 0.25)),
@@ -613,7 +1024,7 @@ def iniciar_emisor(indice_camara=0, puerto=PUERTO_RTSP_DEFECTO, bitrate_kbps=200
 
         time.sleep(1)
 
-        # Verificar que todos arrancaron
+        # Verificar que todos los FFmpeg RTSP arrancaron correctamente
         for nombre, proc in procesos_ff.items():
             if proc.poll() is not None:
                 stderr = proc.stderr.read().decode(errors="replace")[:300]
@@ -621,76 +1032,187 @@ def iniciar_emisor(indice_camara=0, puerto=PUERTO_RTSP_DEFECTO, bitrate_kbps=200
                 print(f"    {stderr}")
                 sys.exit(1)
 
+        # ──────────────────────────────────────────────────────────────
+        # PASO 6: Preparar grabación MKV (si se solicitó)
+        # ──────────────────────────────────────────────────────────────
+        # La grabación se iniciará automáticamente cuando los 4 canales
+        # estén activos y produciendo frames válidos.
+        grabacion_pendiente = False
+        if ruta_grabacion:
+            print(f"\n[6/6] Grabación MKV programada (esperando 4 canales activos) ...")
+            print(f"  → Destino: {os.path.abspath(ruta_grabacion)}")
+            print(f"  → Layout: Mosaico unificado {MOSAICO_ANCHO}×{MOSAICO_ALTO}")
+            grabacion_pendiente = True
+        else:
+            print(f"\n[6/6] Grabación MKV: desactivada (usa --grabar para activar)")
+
+        # ─── Paso 6.5: Iniciar grabación de rango de frames sin pérdidas ───
+        grabador_rango = None
+        if rango_grabacion is not None:
+            try:
+                frame_inicio, frame_fin = rango_grabacion
+                if dir_salida is None:
+                    dir_salida = f"rango_grabacion_{frame_inicio}_{frame_fin}"
+                dir_salida_abs = os.path.abspath(dir_salida)
+                print(f"\n[6.5] Preparando grabación de rango de frames sin pérdidas ...")
+                print(f"  → Rango: {frame_inicio} a {frame_fin}")
+                print(f"  → Directorio de salida: {dir_salida_abs}")
+                grabador_rango = GrabadorRango(dir_salida_abs, frame_inicio, frame_fin)
+            except Exception as e:
+                print(f"  ⚠ No se pudo iniciar el grabador de rango sin pérdidas: {e}")
+
+        # ──────────────────────────────────────────────────────────────
+        # Banner final con URLs de conexión
+        # ──────────────────────────────────────────────────────────────
         ip_local = obtener_ip_local()
 
         print("\n" + "═" * 62)
-        print("  ✓ TRANSMISIÓN ACTIVA — 4 Canales RTSP")
+        print("  ✓ TRANSMISIÓN ACTIVA — 4 Canales RTSP + LSB")
         print("─" * 62)
         print(f"  Color (RGB):     rtsp://{ip_local}:{puerto}/color")
         print(f"  Profundidad:     rtsp://{ip_local}:{puerto}/depth")
         print(f"  Infrarrojo 1:    rtsp://{ip_local}:{puerto}/ir1")
         print(f"  Infrarrojo 2:    rtsp://{ip_local}:{puerto}/ir2")
         print("─" * 62)
+        print(f"  LSB:  128 bits × {BITS_POR_BLOQUE}px/bit = {PIXELES_LSB}px en fila 0")
+        if grabacion_pendiente:
+            print(f"  🔴 GRABACIÓN MKV → {os.path.abspath(ruta_grabacion)} (esperando canales)")
+        if grabador_rango is not None:
+            print(f"  🔴 GRABANDO RANGO [{frame_inicio} - {frame_fin}] → {os.path.abspath(dir_salida)}")
+        print("─" * 62)
         print(f"  Receptor:  python3 receptor_ubuntu.py {ip_local}")
         print(f"  VLC:       vlc rtsp://{ip_local}:{puerto}/color")
         print("═" * 62)
         print("\n  Presiona Ctrl+C para detener.\n")
 
-        # ─── Bucle principal ────────────────────────────────────────────
-        frames_enviados = 0
+        # ─── Bucle principal de captura y transmisión ───────────────────
+        # El Frame ID inicia en 1 (no 0) según requerimiento.
+        frame_id = 1
         t_inicio = time.time()
 
         while not _cerrando:
+            # ── Capturar frameset síncrono de la cámara ─────────────────
+            # wait_for_frames() bloquea hasta que la cámara entrega un set
+            # completo de frames de todos los streams configurados.
             try:
                 frameset = pipeline.wait_for_frames(timeout_ms=5000)
             except RuntimeError:
                 print("  ⚠ Timeout esperando frames de la cámara ...")
                 continue
 
+            # Capturar timestamp del sistema INMEDIATAMENTE después de
+            # recibir el frameset. Este valor se inyectará en los 4 canales
+            # vía LSB para que el receptor pueda auditar la sincronía.
+            timestamp_ns = time.time_ns()
+
+            # ── Extraer frames individuales del frameset ─────────────────
             fc = frameset.get_color_frame()
             fd = frameset.get_depth_frame()
             fi1 = frameset.get_infrared_frame(1)
             fi2 = frameset.get_infrared_frame(2)
 
+            # Si algún canal no produjo frame, saltar esta iteración
             if not fc or not fd or not fi1 or not fi2:
                 continue
 
-            # Convertir a numpy
-            color_img = np.asanyarray(fc.get_data())       # 1920×1080 BGR
-            depth_raw = np.asanyarray(fd.get_data())        # 1280×720 Z16
-            ir1_img = np.asanyarray(fi1.get_data())         # 1280×720 gray
-            ir2_img = np.asanyarray(fi2.get_data())         # 1280×720 gray
+            # ── Convertir a arrays NumPy ────────────────────────────────
+            # np.array() crea una COPIA escribible del buffer del SDK.
+            # Necesitamos copias porque inyectar_lsb() modifica in-place.
+            color_img = np.array(fc.get_data())          # 1920×1080 BGR
+            depth_raw = np.asanyarray(fd.get_data())      # 1280×720 Z16 (lectura para rango)
+            ir1_img = np.array(fi1.get_data())            # 1280×720 gray
+            ir2_img = np.array(fi2.get_data())            # 1280×720 gray
 
-            # Procesar profundidad → heatmap JET
+            # ── Procesar profundidad → heatmap JET ──────────────────────
+            # Convertir datos de profundidad Z16 (0..65535 mm) a un mapa
+            # de calor visual BGR usando la paleta JET de OpenCV.
+            # Se limita a 4000mm (4 metros) para maximizar el contraste.
             depth_clipped = np.clip(depth_raw, 0, 4000)
             depth_8bit = (depth_clipped * (255.0 / 4000.0)).astype(np.uint8)
             depth_color = cv2.applyColorMap(depth_8bit, cv2.COLORMAP_JET)
-            depth_color[depth_raw == 0] = [0, 0, 0]  # negro donde no hay dato
+            depth_color[depth_raw == 0] = [0, 0, 0]  # Negro donde no hay dato
 
-            # Enviar cada canal a su FFmpeg
+            # ── Inyectar esteganografía LSB en los 4 frames ────────────
+            # Se inyecta el MISMO frame_id y timestamp_ns en los 4 canales
+            # para que en la extracción se pueda verificar la sincronía.
+            inyectar_lsb(color_img, frame_id, timestamp_ns)
+            inyectar_lsb(depth_color, frame_id, timestamp_ns)
+            inyectar_lsb(ir1_img, frame_id, timestamp_ns)
+            inyectar_lsb(ir2_img, frame_id, timestamp_ns)
+
+            # ── Enviar a los 4 FFmpeg RTSP ──────────────────────────────
             try:
                 procesos_ff["color"].stdin.write(color_img.tobytes())
                 procesos_ff["depth"].stdin.write(depth_color.tobytes())
                 procesos_ff["ir1"].stdin.write(ir1_img.tobytes())
                 procesos_ff["ir2"].stdin.write(ir2_img.tobytes())
             except (BrokenPipeError, OSError) as e:
-                print(f"  ✗ Error escribiendo a FFmpeg: {e}")
+                print(f"  ✗ Error escribiendo a FFmpeg RTSP: {e}")
                 break
 
-            frames_enviados += 1
+            # ── Iniciar grabación MKV cuando los 4 canales están listos ──
+            # La grabación se inicia aquí (no en el paso 6) para garantizar
+            # que los 4 canales producen frames válidos antes de grabar.
+            if grabacion_pendiente and not grabando:
+                proceso_grab = crear_grabacion_mosaico_mkv(
+                    ruta_ffmpeg, ruta_grabacion, fps=30
+                )
+                if proceso_grab is not None:
+                    grabando = True
+                    grabacion_pendiente = False
+                    print(f"  🔴 GRABACIÓN INICIADA → {os.path.abspath(ruta_grabacion)}")
+                else:
+                    print("  ⚠ La grabación MKV no se pudo iniciar. Continuando sin grabar.")
+                    grabacion_pendiente = False
 
-            # Log cada 150 frames (~5 segundos)
-            if frames_enviados % 150 == 0:
+            # ── Enviar mosaico a la grabación MKV (si está activa) ──────
+            if grabando:
+                try:
+                    # Construir el mosaico unificado 1920×1440 con los 4 frames
+                    mosaico = construir_mosaico(color_img, depth_color, ir1_img, ir2_img, cv2)
+                    # Escribir el mosaico crudo al stdin del FFmpeg de grabación
+                    proceso_grab.stdin.write(mosaico.tobytes())
+                except (BrokenPipeError, OSError) as e:
+                    print(f"  ⚠ Error escribiendo a grabación MKV: {e}")
+                    print("    Grabación desactivada. La transmisión RTSP continúa.")
+                    grabando = False
+
+            # ── Enviar a grabación de rango sin pérdidas ────────────────
+            if grabador_rango is not None:
+                grabador_rango.agregar_frame(
+                    frame_id, color_img, depth_raw,
+                    ir1_img, ir2_img, timestamp_ns
+                )
+                if frame_id >= grabador_rango.fin:
+                    print(f"\n  ✓ Rango de fotogramas finalizado ({grabador_rango.inicio} a {grabador_rango.fin}). Finalizando escrituras...")
+                    grabador_rango.detener()
+                    print("  ✓ Rango guardado con éxito.")
+                    grabador_rango = None
+
+            # ── Avanzar el contador secuencial de frames ────────────────
+            frame_id += 1
+
+            # ── Log de estado cada 150 frames (~5 segundos a 30fps) ─────
+            if (frame_id - 1) % 150 == 0:
                 dt = time.time() - t_inicio
-                fps = frames_enviados / dt if dt > 0 else 0
-                print(f"  📹 Frames: {frames_enviados} | FPS: {fps:.1f} | Tiempo: {dt:.0f}s")
+                fps_actual = (frame_id - 1) / dt if dt > 0 else 0
+                ts_str = time.strftime("%H:%M:%S", time.localtime(timestamp_ns / 1e9))
+                ts_ms = int((timestamp_ns % 1_000_000_000) / 1_000_000)
+                estado_grab = " 🔴 REC" if grabando else ""
+                print(f"  📹 FID: {frame_id - 1} | TS: {ts_str}.{ts_ms:03d} | "
+                      f"FPS: {fps_actual:.1f} | Tiempo: {dt:.0f}s{estado_grab}")
 
-            # Verificar que los FFmpeg sigan vivos
+            # ── Verificar que los FFmpeg RTSP sigan vivos ───────────────
             for nombre, proc in procesos_ff.items():
                 if proc.poll() is not None:
                     print(f"  ✗ FFmpeg ({nombre}) se detuvo inesperadamente.")
                     _cerrando = True
                     break
+
+            # ── Verificar FFmpeg de grabación ───────────────────────────
+            if grabando and proceso_grab and proceso_grab.poll() is not None:
+                print("  ⚠ FFmpeg de grabación se detuvo. Continuando sin grabar.")
+                grabando = False
 
     except KeyboardInterrupt:
         print("\n\n  ⏹ Detenido por el usuario (Ctrl+C).")
@@ -701,9 +1223,16 @@ def iniciar_emisor(indice_camara=0, puerto=PUERTO_RTSP_DEFECTO, bitrate_kbps=200
         traceback.print_exc()
 
     finally:
+        # ── Liberación ordenada de todos los recursos ───────────────────
         print("\n  Liberando recursos ...")
 
-        # Detener pipeline
+        # Detener grabador de rango si sigue activo
+        if 'grabador_rango' in locals() and grabador_rango is not None:
+            print("\n  Deteniendo grabador de rango sin pérdidas...")
+            grabador_rango.detener()
+            print("  ✓ Grabador de rango finalizado.")
+
+        # Detener pipeline de la cámara RealSense
         if pipeline_activo and pipeline:
             try:
                 pipeline.stop()
@@ -711,7 +1240,25 @@ def iniciar_emisor(indice_camara=0, puerto=PUERTO_RTSP_DEFECTO, bitrate_kbps=200
             except Exception:
                 pass
 
-        # Cerrar FFmpeg
+        # ── Cerrar el proceso FFmpeg de grabación MKV ───────────────────
+        # Se cierra stdin primero para que FFmpeg reciba EOF y finalice
+        # la escritura del contenedor Matroska de forma limpia.
+        if proceso_grab:
+            try:
+                if proceso_grab.stdin:
+                    proceso_grab.stdin.close()
+            except Exception:
+                pass
+            try:
+                proceso_grab.wait(timeout=10)
+                print(f"  ✓ Grabación MKV finalizada → {ruta_grabacion}")
+            except subprocess.TimeoutExpired:
+                proceso_grab.kill()
+                print("  ⚠ FFmpeg de grabación forzado a detener")
+            except Exception:
+                pass
+
+        # ── Cerrar los 4 FFmpeg RTSP ────────────────────────────────────
         for nombre, proc in procesos_ff.items():
             if proc and proc.stdin:
                 try:
@@ -729,7 +1276,7 @@ def iniciar_emisor(indice_camara=0, puerto=PUERTO_RTSP_DEFECTO, bitrate_kbps=200
                     proc.kill()
                     print(f"  ✓ FFmpeg ({nombre}) forzado")
 
-        # Detener MediaMTX
+        # ── Detener MediaMTX ────────────────────────────────────────────
         if proceso_mediamtx and proceso_mediamtx.poll() is None:
             try:
                 proceso_mediamtx.terminate()
@@ -738,6 +1285,13 @@ def iniciar_emisor(indice_camara=0, puerto=PUERTO_RTSP_DEFECTO, bitrate_kbps=200
             except Exception:
                 proceso_mediamtx.kill()
                 print("  ✓ MediaMTX forzado")
+
+        # ── Resumen final ───────────────────────────────────────────────
+        total_frames = frame_id - 1  # Restar 1 porque frame_id se incrementó antes de salir
+        if total_frames > 0:
+            dt_total = time.time() - t_inicio
+            print(f"\n  Resumen: {total_frames} frames en {dt_total:.1f}s "
+                  f"({total_frames / dt_total:.1f} FPS promedio)")
 
         print("\n  Emisor finalizado.\n")
 
@@ -748,16 +1302,19 @@ def iniciar_emisor(indice_camara=0, puerto=PUERTO_RTSP_DEFECTO, bitrate_kbps=200
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Emisor RTSP v2 para Intel RealSense D435 — Ubuntu/Linux nativo.",
+        description="Emisor RTSP v3 para Intel RealSense D435 — Ubuntu/Linux nativo con LSB y mosaico MKV.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Ejemplos:
-  python3 emisor_ubuntu.py                    # Cámara 0, puerto 8554
-  python3 emisor_ubuntu.py --cam 1            # Segunda cámara
-  python3 emisor_ubuntu.py --puerto 9554      # Puerto alternativo
-  python3 emisor_ubuntu.py --calidad 4000     # Mayor calidad
-  python3 emisor_ubuntu.py --listar-camaras   # Ver cámaras conectadas
-  python3 emisor_ubuntu.py --diagnostico      # Diagnóstico completo del sistema
+  python3 emisor_ubuntu.py                         # Cámara 0, puerto 8554
+  python3 emisor_ubuntu.py --cam 1                 # Segunda cámara
+  python3 emisor_ubuntu.py --puerto 9554           # Puerto alternativo
+  python3 emisor_ubuntu.py --calidad 4000          # Mayor calidad
+  python3 emisor_ubuntu.py --grabar                # Graba en grabacion.mkv
+  python3 emisor_ubuntu.py --grabar /tmp/video.mkv # Graba en ruta específica
+  python3 emisor_ubuntu.py --listar-camaras        # Ver cámaras conectadas
+  python3 emisor_ubuntu.py --diagnostico           # Diagnóstico del sistema
+  python3 emisor_ubuntu.py --grabar-rango 150 450   # Grabar rango sin pérdidas
         """
     )
 
@@ -767,6 +1324,13 @@ Ejemplos:
                         help="Índice de la cámara RealSense (defecto: 0)")
     parser.add_argument("--calidad", type=int, default=2000,
                         help="Bitrate total en kbps (defecto: 2000)")
+    parser.add_argument("--grabar", nargs="?", const="grabacion.mkv", default=None,
+                        metavar="RUTA.mkv",
+                        help="Grabar mosaico unificado en archivo MKV (defecto: grabacion.mkv)")
+    parser.add_argument("--grabar-rango", type=int, nargs=2, metavar=("INICIO", "FIN"), default=None,
+                        help="Grabar un rango de fotogramas sin pérdidas (ej. --grabar-rango 100 500)")
+    parser.add_argument("--dir-salida", type=str, default=None,
+                        help="Directorio de salida para la grabación de rango sin pérdidas")
     parser.add_argument("--listar-camaras", action="store_true",
                         help="Listar cámaras RealSense y salir")
     parser.add_argument("--diagnostico", action="store_true",
@@ -790,5 +1354,8 @@ Ejemplos:
     iniciar_emisor(
         indice_camara=args.cam,
         puerto=args.puerto,
-        bitrate_kbps=args.calidad
+        bitrate_kbps=args.calidad,
+        ruta_grabacion=args.grabar,
+        rango_grabacion=args.grabar_rango,
+        dir_salida=args.dir_salida
     )

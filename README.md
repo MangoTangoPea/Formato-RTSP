@@ -1,39 +1,42 @@
-# Demo RTSP — Transmisión de Mosaico RealSense D435
+# Demo RTSP — Transmisión de Mosaico RealSense D435 y Grabación Crítica
 
-Sistema de transmisión de vídeo en tiempo real en red local utilizando el protocolo **RTSP**. El emisor captura streams simultáneos (RGB, Infrarrojos y Profundidad) de una cámara **Intel RealSense D435**, los publica como 4 canales RTSP independientes y el receptor los recibe, combinándolos en un mosaico interactivo de alta resolución (1920x1440) con controles de vista.
+Sistema de transmisión de vídeo en tiempo real en red local utilizando el protocolo **RTSP** con **Esteganografía LSB (Least Significant Bit)** de 128 bits y **grabación local unificada** en formato Matroska (.mkv) en forma de mosaico de una sola vista.
+
+El emisor captura 4 streams simultáneos (RGB, Infrarrojos y Profundidad) de una cámara **Intel RealSense D435**, inyecta metadatos síncronos ocultos (Frame ID y marcas de tiempo en nanosegundos) en cada cuadro, los transmite como canales RTSP independientes y el receptor los recibe, mostrando el mosaico y el estado de sincronía real de la red en pantalla.
+
+*Para detalles matemáticos, análisis de resiliencia del contenedor Matroska ante fallos de energía y especificación de ingeniería del pipeline, consulte la [Guía Técnica de Esteganografía y Grabación](file:///c:/Users/Luis%20Fdo/Documents/GitHub/Formato-RTSP/DOCUMENTACION_TECNICA.md).*
 
 ## Arquitectura del sistema
 
 ```
-  ┌──────────────────┐               
-  │  RealSense D435  │               
-  │ (RGB, Depth, IR) │               
-  └────────┬─────────┘               
-           │ (4 streams)             
-           ▼                         
-      ┌──────────┐    raw frames      ┌─────────┐   RTSP/RTP    ┌──────────┐
-      │  Emisor  │ ─────────────────► │ FFmpeg  │ ────────────► │ MediaMTX │
-      │ (Python) │   vía pipe/stdin   │ (H.264) │  ANNOUNCE +   │ (server  │
-      │          │   (4 canales)      │ x4 proc │  RECORD        │  RTSP)   │
-      └──────────┘                    └─────────┘               └────┬─────┘
-       emisor.py                                                     │
-                                                   rtsp://<IP>:8554/color
-                                                   rtsp://<IP>:8554/depth
-                                                   rtsp://<IP>:8554/ir1
-                                                   rtsp://<IP>:8554/ir2
-                                                                     │
-                                                                ┌────▼─────┐
-                                                                │ Receptor │
-                                                                │ (OpenCV) │
-                                                                └──────────┘
-                                                                 receptor.py
+   ┌────────────────────────────────────────────────────────┐
+   │ Captura RealSense (wait_for_frames) -> Timestamp Único │
+   └──────────────────────────┬─────────────────────────────┘
+                              │
+               [ Inyección LSB en 4 canales ]
+                              ├──────────────────────────────┐
+                              ▼                              ▼
+                 ┌───────────────────────────┐  ┌─────────────────────────┐
+                 │ 4 FFmpeg codificando H.264│  │  Construcción Mosaico   │
+                 └────────────┬──────────────┘  │    NumPy 1920x1440      │
+                              │                 └────────────┬────────────┘
+                              ▼                              │ (stdin pipe)
+                 ┌───────────────────────────┐               ▼
+                 │ MediaMTX (RTSP Broker)    │  ┌─────────────────────────┐
+                 └────────────┬──────────────┘  │ 1 FFmpeg local (H.264)  │
+                              │                 └────────────┬────────────┘
+         rtsp://<IP>:8554/color,depth,ir1,ir2                │
+                              │                              ▼
+                              ▼                 ┌─────────────────────────┐
+                       ┌──────────────┐         │  Archivo Matroska .mkv  │
+                       │ Receptor OSD │         └─────────────────────────┘
+                       │   (OpenCV)   │         (Mosaico unificado/Failsafe)
+                       └──────────────┘
 ```
 
-### ¿Qué es RTSP?
-
-**RTSP** (Real Time Streaming Protocol) es un protocolo de capa de aplicación diseñado para controlar la entrega de datos en tiempo real. A diferencia de HTTP, RTSP no transporta los datos multimedia directamente — usa **RTP** (Real-time Transport Protocol) para eso.
-
-**Analogía simple:** RTSP es como el control remoto de un reproductor de vídeo: le dices "play", "pause", "stop". RTP es el cable que lleva el vídeo real.
+### ¿Qué es RTSP y Esteganografía LSB?
+*   **RTSP** (Real Time Streaming Protocol): Controla la entrega de flujos multimedia en tiempo real en red local.
+*   **Esteganografía LSB**: Modifica el bit menos significativo de la fila 0 (canal azul de BGR o píxel de escala de grises) para ocultar 128 bits de datos de control (Frame ID + Timestamp del emisor). El impacto visual es invisible ($\approx 0.39\%$ de variación), permitiendo que el receptor audite visualmente la sincronía física y la latencia exacta de red en el HUD.
 
 | Protocolo | Función | Transporte | Puerto por defecto |
 |-----------|---------|------------|-------------------|
@@ -45,10 +48,10 @@ Sistema de transmisión de vídeo en tiempo real en red local utilizando el prot
 
 | Componente | Rol | Descripción |
 |------------|-----|-------------|
-| **`emisor.py`** | Publicador RTSP | Captura 4 flujos nativos (Color, Depth, IR1, IR2) de la Intel RealSense D435 y los publica como canales RTSP independientes. |
-| **`receptor.py`** | Cliente RTSP | Se conecta a los 4 canales, los combina en un mosaico interactivo y permite ver cada canal individualmente. |
+| **`emisor.py` / `emisor_ubuntu.py`** | Publicador RTSP y Grabador | Captura flujos nativos, inyecta LSB, los transmite vía RTSP y los graba localmente en un archivo MKV unificado en mosaico 1920×1440. |
+| **`receptor.py` / `receptor_ubuntu.py`** | Cliente RTSP | Conecta a los 4 canales, extrae la esteganografía LSB con votación de mayoría y muestra la visualización interactiva y el HUD de sincronía. |
 | **MediaMTX** | Servidor RTSP (Broker) | Servidor ligero de alta velocidad que gestiona el streaming RTSP. Recibe la publicación de FFmpeg y la retransmite bajo demanda. |
-| **FFmpeg** | Codificador de Vídeo | Codifica en tiempo real los frames crudos BGR24 en paquetes H.264 comprimidos de baja latencia. |
+| **FFmpeg** | Codificador de Vídeo | Codifica en tiempo real los frames crudos en H.264 de ultra baja latencia y escribe el contenedor Matroska. |
 
 ### ¿Para qué se usa MediaMTX en este proyecto?
 
@@ -197,30 +200,29 @@ Deberías ver algo como:
 
 ```
 ═══════════════════════════════════════════════════════════
-  EMISOR RTSP — Transmisión de cámara local
+  EMISOR RTSP RealSense — Windows (v3)
+  Esteganografía LSB activa · Bloques de 8px por bit
 ═══════════════════════════════════════════════════════════
 
-[1/4] Verificando FFmpeg ...
-  ✓ FFmpeg encontrado
-
-[2/4] Preparando servidor RTSP (MediaMTX) ...
-  ↓ Descargando MediaMTX v1.12.2 ...       ← (solo la primera vez)
-  ✓ MediaMTX instalado en: ...\mediamtx\mediamtx.exe
-  → Iniciando MediaMTX en el puerto 8554 ...
+[1/5] Verificando FFmpeg (vía imageio-ffmpeg) ...
+  ✓ FFmpeg encontrado: ...
+[2/5] Preparando servidor RTSP (MediaMTX) ...
   ✓ MediaMTX iniciado (PID: 12345)
-
-[3/4] Abriendo cámara (índice 0) ...
-  ✓ Cámara abierta: 640x480 @ 30 FPS
-
-[4/4] Iniciando transmisión RTSP ...
-  ✓ Transmisión RTSP activa
+[3/5] Abriendo dispositivo Intel RealSense (índice 0) ...
+  ✓ Pipeline RealSense iniciado correctamente.
+[4/5] Iniciando transmisión RTSP de 4 canales ...
+[5/5] Grabación local MKV programada (esperando fotogramas activos) ...
+  → Destino: C:\ruta\al\proyecto\grabacion.mkv
 
 ═══════════════════════════════════════════════════════════
-  URL RTSP del flujo:
-  → rtsp://192.168.1.42:8554/camara
-
-  Los receptores deben conectarse a esta URL.
-  También puedes probar con VLC: Medio → Abrir ubicación de red
+  ✓ TRANSMISIÓN ACTIVA — 4 Canales RTSP + LSB
+───────────────────────────────────────────────────────────
+  Color (RGB):   rtsp://192.168.1.42:8554/color
+  Depth Map:     rtsp://192.168.1.42:8554/depth
+  Infrared 1:    rtsp://192.168.1.42:8554/ir1
+  Infrared 2:    rtsp://192.168.1.42:8554/ir2
+───────────────────────────────────────────────────────────
+  LSB:  128 bits × 8px/bit = 1024px en fila 0
 ═══════════════════════════════════════════════════════════
 
   Presiona Ctrl+C para detener la transmisión.
@@ -419,44 +421,49 @@ Deberías ver:
 
 ```
 ══════════════════════════════════════════════════════════════
-  EMISOR RTSP — Intel RealSense D435 · Ubuntu Nativo (v2)
+  EMISOR RTSP — Intel RealSense D435 · Ubuntu Nativo (v3)
+  Esteganografía LSB activa · Bloques de 8px por bit
 ══════════════════════════════════════════════════════════════
 
-[1/5] Buscando FFmpeg ...
+[1/6] Buscando FFmpeg ...
   ✓ FFmpeg: /usr/bin/ffmpeg
     Origen: sistema (ffmpeg version 6.1.1-3ubuntu5)
 
-[2/5] Verificando dependencias Python ...
+[2/6] Verificando dependencias Python ...
   ✓ OpenCV 4.x.x
   ✓ NumPy 1.x.x
   ✓ pyrealsense2 disponible
   ✓ Reglas udev: /etc/udev/rules.d/99-realsense-libusb.rules
 
-[3/5] Preparando servidor RTSP (MediaMTX) ...
+[3/6] Preparando servidor RTSP (MediaMTX) ...
   ✓ MediaMTX corriendo (PID 12345)
 
-[4/5] Abriendo cámara Intel RealSense (índice 0) ...
+[4/6] Abriendo cámara Intel RealSense (índice 0) ...
   → Dispositivo: Intel RealSense D435 (S/N: 123456789)
   ✓ Pipeline iniciado (Color 1920×1080, Depth/IR 1280×720 @ 30fps)
 
-[5/5] Iniciando transmisión de 4 canales RTSP ...
+[5/6] Iniciando transmisión de 4 canales RTSP ...
   → color  1920×1080 @ 1100kbps → rtsp://127.0.0.1:8554/color
   → depth  1280×720  @ 500kbps  → rtsp://127.0.0.1:8554/depth
   → ir1    1280×720  @ 200kbps  → rtsp://127.0.0.1:8554/ir1
   → ir2    1280×720  @ 200kbps  → rtsp://127.0.0.1:8554/ir2
-  ✓ Transmisión RTSP activa para los 4 canales
+
+[6/6] Grabación local MKV programada (esperando fotogramas activos) ...
+  → Destino: /ruta/al/proyecto/grabacion.mkv
 
 ══════════════════════════════════════════════════════════════
-  ✓ TRANSMISIÓN ACTIVA — 4 Canales RTSP
+  ✓ TRANSMISIÓN ACTIVA — 4 Canales RTSP + LSB
 ──────────────────────────────────────────────────────────────
   Color (RGB):     rtsp://192.168.1.42:8554/color
   Profundidad:     rtsp://192.168.1.42:8554/depth
   Infrarrojo 1:    rtsp://192.168.1.42:8554/ir1
   Infrarrojo 2:    rtsp://192.168.1.42:8554/ir2
 ──────────────────────────────────────────────────────────────
+  LSB:  128 bits × 8px/bit = 1024px en fila 0
   Receptor:  python3 receptor_ubuntu.py 192.168.1.42
   VLC:       vlc rtsp://192.168.1.42:8554/color
 ══════════════════════════════════════════════════════════════
+```
 
   Presiona Ctrl+C para detener.
 ```
@@ -621,10 +628,11 @@ python emisor.py --puerto 9554
 
 ```text
 Demo RTSP/
-├── emisor.py                  # Emisor para Windows nativo
-├── emisor_ubuntu.py           # Emisor para Ubuntu nativo (v2 — versión actual)
-├── receptor.py                # Receptor para Windows nativo
-├── receptor_ubuntu.py         # Receptor para Ubuntu nativo (v2 — versión actual)
+├── emisor.py                  # Emisor para Windows nativo (v3 — esteganografía y mosaico MKV)
+├── emisor_ubuntu.py           # Emisor para Ubuntu nativo (v3 — esteganografía y mosaico MKV)
+├── receptor.py                # Receptor para Windows nativo (v3 — HUD y verificación LSB)
+├── receptor_ubuntu.py         # Receptor para Ubuntu nativo (v3 — HUD y verificación LSB)
+├── DOCUMENTACION_TECNICA.md   # Documentación detallada de esteganografía LSB y resiliencia MKV
 ├── requirements.txt           # Dependencias Python (Windows)
 ├── requirements_ubuntu.txt    # Dependencias Python (Ubuntu)
 ├── install_realsense.sh       # Script de compilación USB para WSL (legacy)

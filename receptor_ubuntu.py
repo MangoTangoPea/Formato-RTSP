@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
-Receptor RTSP Multicanal — Ubuntu/Linux Nativo (v2).
+Receptor RTSP Multicanal — Ubuntu/Linux Nativo (v3).
 
-Rediseñado desde cero para funcionar de forma nativa en Linux.
+Rediseñado con extracción de esteganografía LSB para verificación de sincronía.
 Se conecta a 4 streams RTSP independientes del emisor RealSense D435
-(Color, Depth, IR1, IR2) y ofrece múltiples modos de visualización.
+(Color, Depth, IR1, IR2) y extrae los metadatos ocultos (Frame ID + Timestamp)
+para mostrar la sincronía real entre canales en el HUD.
 
 Controles de teclado:
   m  → Mosaico (4 vistas combinadas)
@@ -28,6 +29,8 @@ import time
 import argparse
 import os
 import threading
+import struct
+import datetime
 
 # ─── Verificar dependencias ──────────────────────────────────────────────
 try:
@@ -51,7 +54,7 @@ except ImportError:
 # ═══════════════════════════════════════════════════════════════════════════
 
 PUERTO_RTSP_DEFECTO = 8554
-NOMBRE_VENTANA = "Receptor RTSP — RealSense D435 (Ubuntu v2)"
+NOMBRE_VENTANA = "Receptor RTSP — RealSense D435 (Ubuntu v3 · LSB)"
 
 # Nombres y colores temáticos para cada canal
 CANALES_INFO = {
@@ -63,6 +66,55 @@ CANALES_INFO = {
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# ESTEGANOGRAFÍA LSB — EXTRACCIÓN
+# ═══════════════════════════════════════════════════════════════════════════
+
+BITS_POR_BLOQUE = 8
+TOTAL_BITS = 128
+PIXELES_LSB = TOTAL_BITS * BITS_POR_BLOQUE  # 1024
+
+
+def extraer_lsb(frame):
+    """
+    Extrae 128 bits de metadatos LSB de la primera fila del frame
+    usando majority voting sobre bloques de BITS_POR_BLOQUE píxeles.
+
+    Retorna (frame_id, timestamp_ns) o (None, None) si no es posible.
+    """
+    try:
+        ancho = frame.shape[1] if frame.ndim >= 2 else 0
+        if ancho < PIXELES_LSB:
+            return None, None
+
+        if frame.ndim == 3:
+            fila = frame[0, :PIXELES_LSB, 0]   # Canal Azul
+        else:
+            fila = frame[0, :PIXELES_LSB]
+
+        lsbs = (fila & np.uint8(1)).reshape(TOTAL_BITS, BITS_POR_BLOQUE)
+        bits = (lsbs.sum(axis=1) > BITS_POR_BLOQUE // 2).astype(np.uint8)
+
+        datos = np.packbits(bits)
+        frame_id, timestamp_ns = struct.unpack('>QQ', datos.tobytes())
+        return frame_id, timestamp_ns
+    except Exception:
+        return None, None
+
+
+def formatear_timestamp_ns(timestamp_ns):
+    """Formatea un timestamp en nanosegundos como HH:MM:SS.mmm"""
+    if timestamp_ns is None or timestamp_ns == 0:
+        return "--:--:--.---"
+    try:
+        ts_sec = timestamp_ns / 1e9
+        dt = datetime.datetime.fromtimestamp(ts_sec)
+        ms = int((timestamp_ns % 1_000_000_000) / 1_000_000)
+        return dt.strftime("%H:%M:%S") + f".{ms:03d}"
+    except (OSError, ValueError, OverflowError):
+        return "--:--:--.---"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # LECTOR DE STREAM RTSP (hilo dedicado)
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -71,6 +123,7 @@ class LectorRTSP:
     Lector asíncrono de un flujo RTSP usando un hilo dedicado.
     Mantiene solo el frame más reciente para evitar acumulación de buffer.
     Implementa reconexión automática con backoff.
+    Extrae metadatos LSB (Frame ID + Timestamp) de cada frame recibido.
     """
 
     def __init__(self, url, nombre):
@@ -88,6 +141,10 @@ class LectorRTSP:
         self._t_fps = time.time()
         self._contador_fps = 0
 
+        # Metadatos LSB
+        self.frame_id = None
+        self.timestamp_ns = None
+
     def iniciar(self):
         """Arranca el hilo de lectura."""
         self.corriendo = True
@@ -99,12 +156,12 @@ class LectorRTSP:
         self.hilo.start()
 
     def _bucle_lectura(self):
-        """Bucle interno del hilo: conecta, lee frames, reconecta si falla."""
+        """Bucle interno del hilo: conecta, lee frames, extrae LSB, reconecta si falla."""
         # Forzar transporte TCP para OpenCV
         os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp"
 
         cap = None
-        backoff = 0.5  # segundos de espera entre reintentos
+        backoff = 0.5
 
         while self.corriendo:
             # Intentar conexión
@@ -116,7 +173,7 @@ class LectorRTSP:
                     cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
                     with self.lock:
                         self.conectado = True
-                    backoff = 0.5  # reset backoff
+                    backoff = 0.5
                 else:
                     time.sleep(min(backoff, 5.0))
                     backoff = min(backoff * 1.5, 5.0)
@@ -132,10 +189,15 @@ class LectorRTSP:
                 time.sleep(0.3)
                 continue
 
+            # Extraer metadatos LSB antes de cualquier transformación
+            fid, ts = extraer_lsb(frame)
+
             with self.lock:
                 self.frame = frame
                 self.frames_recibidos += 1
                 self._contador_fps += 1
+                self.frame_id = fid
+                self.timestamp_ns = ts
 
             # Calcular FPS cada segundo
             ahora = time.time()
@@ -159,6 +221,11 @@ class LectorRTSP:
         """Retorna (conectado, fps, total_frames)."""
         with self.lock:
             return self.conectado, self.fps, self.frames_recibidos
+
+    def obtener_metadatos(self):
+        """Retorna (frame_id, timestamp_ns) extraídos por LSB."""
+        with self.lock:
+            return self.frame_id, self.timestamp_ns
 
     def detener(self):
         """Detiene el hilo de lectura."""
@@ -191,19 +258,21 @@ def crear_placeholder(ancho, alto, texto, subtexto=""):
     return img
 
 
-def dibujar_hud(frame, titulo, fps, total_frames, segundos, color_tema=(0, 200, 100)):
+def dibujar_hud(frame, titulo, fps, total_frames, segundos,
+                color_tema=(0, 200, 100), frame_id=None, timestamp_ns=None):
     """
-    Dibuja un HUD semitransparente en la esquina superior izquierda del frame.
+    Dibuja un HUD semitransparente con metadatos LSB reales en la esquina
+    superior izquierda del frame.
     """
     alto, ancho = frame.shape[:2]
 
     # Dimensiones adaptativas
     if ancho >= 1200:
-        bw, bh, escala, salto = 320, 72, 0.45, 20
+        bw, bh, escala, salto = 380, 100, 0.42, 19
     elif ancho >= 800:
-        bw, bh, escala, salto = 260, 64, 0.4, 18
+        bw, bh, escala, salto = 300, 88, 0.38, 17
     else:
-        bw, bh, escala, salto = 200, 56, 0.35, 16
+        bw, bh, escala, salto = 240, 76, 0.34, 15
 
     # Fondo semitransparente
     overlay = frame.copy()
@@ -216,16 +285,60 @@ def dibujar_hud(frame, titulo, fps, total_frames, segundos, color_tema=(0, 200, 
     # Línea 1: Título del canal
     cv2.putText(frame, titulo, (x0, y0), fuente, escala, (255, 255, 255), 1, cv2.LINE_AA)
 
-    # Línea 2: FPS y frames
-    cv2.putText(frame, f"FPS: {fps:.1f}  |  Frames: {total_frames}",
-                (x0, y0 + salto), fuente, escala * 0.9, color_tema, 1, cv2.LINE_AA)
+    # Línea 2: Frame ID y Timestamp (de LSB, no contador local)
+    if frame_id is not None:
+        ts_str = formatear_timestamp_ns(timestamp_ns)
+        cv2.putText(frame, f"FID: {frame_id}  TS: {ts_str}",
+                    (x0, y0 + salto), fuente, escala * 0.9, color_tema, 1, cv2.LINE_AA)
+    else:
+        cv2.putText(frame, f"FID: ---  TS: --:--:--.---",
+                    (x0, y0 + salto), fuente, escala * 0.9, (100, 100, 100), 1, cv2.LINE_AA)
 
-    # Línea 3: Tiempo
-    cv2.putText(frame, f"Tiempo: {int(segundos)}s",
+    # Línea 3: FPS y latencia
+    latencia_str = ""
+    if timestamp_ns is not None and timestamp_ns > 0:
+        latencia_ms = (time.time_ns() - timestamp_ns) / 1_000_000
+        if 0 < latencia_ms < 60_000:  # Máximo 60s de latencia razonable
+            latencia_str = f"  Lat: {latencia_ms:.0f}ms"
+    cv2.putText(frame, f"FPS: {fps:.1f}{latencia_str}",
                 (x0, y0 + 2 * salto), fuente, escala * 0.9, color_tema, 1, cv2.LINE_AA)
 
+    # Línea 4: Frames recibidos localmente
+    cv2.putText(frame, f"Recibidos: {total_frames}  Tiempo: {int(segundos)}s",
+                (x0, y0 + 3 * salto), fuente, escala * 0.85, (150, 150, 150), 1, cv2.LINE_AA)
 
-def dibujar_barra_estado(canvas, modo, segundos, fps_total):
+
+def verificar_sincronia(metadatos):
+    """
+    Compara los Frame IDs de los 4 canales para verificar sincronía.
+
+    Args:
+        metadatos: dict {"color": (fid, ts), "depth": (fid, ts), ...}
+
+    Returns:
+        (sincronizado: bool, delta_max: int, texto: str)
+    """
+    fids = []
+    for nombre, (fid, ts) in metadatos.items():
+        if fid is not None:
+            fids.append(fid)
+
+    if len(fids) < 2:
+        return True, 0, "SYNC: ? (esperando canales)"
+
+    delta = max(fids) - min(fids)
+    n_canales = len(fids)
+
+    if delta <= 1:
+        return True, delta, f"SYNC: OK ({n_canales}/4 canales)"
+    elif delta <= 3:
+        return False, delta, f"SYNC: ~ D={delta} ({n_canales}/4)"
+    else:
+        return False, delta, f"SYNC: DESYNC D={delta} ({n_canales}/4)"
+
+
+def dibujar_barra_estado(canvas, modo, segundos, fps_total, texto_sync="",
+                         sync_ok=True):
     """Dibuja una barra de estado en la parte inferior del canvas."""
     alto, ancho = canvas.shape[:2]
     bar_h = 28
@@ -239,13 +352,14 @@ def dibujar_barra_estado(canvas, modo, segundos, fps_total):
     y_txt = alto - 8
 
     # Izquierda: controles
-    controles = "[M] Mosaico  [1] Color  [2] IR1  [3] Depth  [4] IR2  [H] HUD  [F] Fullscreen  [Q] Salir"
+    controles = "[M] Mosaico  [1] Color  [2] IR1  [3] Depth  [4] IR2  [H] HUD  [F] Full  [Q] Salir"
     cv2.putText(canvas, controles, (10, y_txt), fuente, escala, (150, 150, 150), 1, cv2.LINE_AA)
 
-    # Derecha: info
-    info = f"Vista: {modo.upper()}  |  {int(segundos)}s  |  {fps_total:.0f} fps"
+    # Derecha: sincronía + info
+    color_sync = (0, 200, 100) if sync_ok else (0, 100, 255)
+    info = f"{texto_sync}  |  {modo.upper()}  |  {int(segundos)}s  |  {fps_total:.0f} fps"
     tam = cv2.getTextSize(info, fuente, escala, 1)[0]
-    cv2.putText(canvas, info, (ancho - tam[0] - 10, y_txt), fuente, escala, (0, 200, 100), 1, cv2.LINE_AA)
+    cv2.putText(canvas, info, (ancho - tam[0] - 10, y_txt), fuente, escala, color_sync, 1, cv2.LINE_AA)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -254,8 +368,8 @@ def dibujar_barra_estado(canvas, modo, segundos, fps_total):
 
 def iniciar_receptor(ip, puerto, mostrar_hud=True):
     """
-    Receptor RTSP v2: se conecta a 4 streams independientes del emisor
-    RealSense y ofrece visualización flexible con mosaico y vistas individuales.
+    Receptor RTSP v3: se conecta a 4 streams independientes del emisor
+    RealSense, extrae metadatos LSB y muestra sincronía real en el HUD.
     """
     urls = {
         "color": f"rtsp://{ip}:{puerto}/color",
@@ -265,11 +379,12 @@ def iniciar_receptor(ip, puerto, mostrar_hud=True):
     }
 
     print("\n" + "═" * 62)
-    print("  RECEPTOR RTSP — RealSense D435 · Ubuntu Nativo (v2)")
+    print("  RECEPTOR RTSP — RealSense D435 · Ubuntu Nativo (v3 · LSB)")
     print("═" * 62)
     for nombre, url in urls.items():
         print(f"  {nombre:<6} → {url}")
     print("─" * 62)
+    print("  Extracción LSB: 128 bits × 8px/bit (majority voting)")
     print("  Controles: [M]osaico [1]Color [2]IR1 [3]Depth [4]IR2")
     print("             [H]UD on/off  [F]ullscreen  [Q]Salir")
     print("═" * 62)
@@ -285,15 +400,15 @@ def iniciar_receptor(ip, puerto, mostrar_hud=True):
     # Crear ventana OpenCV con soporte para GUI nativa de Linux
     flags = cv2.WINDOW_NORMAL
     try:
-        flags |= cv2.WINDOW_GUI_NORMAL  # Oculta toolbar de Qt/GTK en Linux
+        flags |= cv2.WINDOW_GUI_NORMAL
     except AttributeError:
-        pass  # No disponible en todas las compilaciones de OpenCV
+        pass
 
     cv2.namedWindow(NOMBRE_VENTANA, flags)
     cv2.resizeWindow(NOMBRE_VENTANA, 1440, 1080)
 
     # Estado de la interfaz
-    modo = "mosaico"  # mosaico, color, ir1, depth, ir2
+    modo = "mosaico"
     hud_visible = mostrar_hud
     pantalla_completa = False
     t_inicio = time.time()
@@ -304,21 +419,31 @@ def iniciar_receptor(ip, puerto, mostrar_hud=True):
             ahora = time.time()
             dt = ahora - t_inicio
 
-            # ─── Obtener frames de cada canal ──────────────────────────
+            # ─── Obtener frames y metadatos de cada canal ──────────────
             frames = {}
             estados = {}
+            metadatos = {}
             for nombre, lector in lectores.items():
                 frames[nombre] = lector.obtener_frame()
                 estados[nombre] = lector.obtener_estado()
+                metadatos[nombre] = lector.obtener_metadatos()
+
+            # Verificar sincronía entre canales
+            sync_ok, sync_delta, sync_texto = verificar_sincronia(metadatos)
 
             # Log de estado de conexión cada 5 segundos
             if ahora - ultimo_log_conexion > 5:
                 for nombre, (conn, fps, total) in estados.items():
-                    estado = "✓ conectado" if conn else "⟳ esperando"
+                    fid, ts = metadatos[nombre]
                     if conn:
-                        print(f"  [{nombre:<6}] {estado} | FPS: {fps:.1f} | Frames: {total}")
+                        ts_str = formatear_timestamp_ns(ts)
+                        fid_str = str(fid) if fid is not None else "---"
+                        print(f"  [{nombre:<6}] ✓ FID: {fid_str:>8} | TS: {ts_str} | "
+                              f"FPS: {fps:.1f} | Frames: {total}")
                     elif total == 0:
-                        print(f"  [{nombre:<6}] {estado} ...")
+                        print(f"  [{nombre:<6}] ⟳ esperando ...")
+                if any(s[0] for s in estados.values()):
+                    print(f"  [{sync_texto}]")
                 ultimo_log_conexion = ahora
 
             # ─── Preparar frames (con placeholders si no hay datos) ────
@@ -350,13 +475,6 @@ def iniciar_receptor(ip, puerto, mostrar_hud=True):
             canvas = None
 
             if modo == "mosaico":
-                # Layout:
-                #   ┌──────────────────────────────────────────┐
-                #   │          Color (RGB) 1920×1080           │
-                #   ├──────────────┬──────────────┬────────────┤
-                #   │  IR1 640×360 │ Depth 640×360│ IR2 640×360│
-                #   └──────────────┴──────────────┴────────────┘
-
                 ir1_small = cv2.resize(f_ir1, (640, 360), interpolation=cv2.INTER_LINEAR)
                 depth_small = cv2.resize(f_depth, (640, 360), interpolation=cv2.INTER_LINEAR)
                 ir2_small = cv2.resize(f_ir2, (640, 360), interpolation=cv2.INTER_LINEAR)
@@ -367,14 +485,19 @@ def iniciar_receptor(ip, puerto, mostrar_hud=True):
                     _, fps_1, tot_1 = estados["ir1"]
                     _, fps_2, tot_2 = estados["ir2"]
 
-                    dibujar_hud(f_color, "Color (RGB) 1920×1080", fps_c, tot_c, dt,
-                                CANALES_INFO["color"]["color"])
+                    fid_c, ts_c = metadatos["color"]
+                    fid_d, ts_d = metadatos["depth"]
+                    fid_1, ts_1 = metadatos["ir1"]
+                    fid_2, ts_2 = metadatos["ir2"]
+
+                    dibujar_hud(f_color, "Color (RGB) 1920x1080", fps_c, tot_c, dt,
+                                CANALES_INFO["color"]["color"], fid_c, ts_c)
                     dibujar_hud(ir1_small, "IR1 (Left)", fps_1, tot_1, dt,
-                                CANALES_INFO["ir1"]["color"])
+                                CANALES_INFO["ir1"]["color"], fid_1, ts_1)
                     dibujar_hud(depth_small, "Profundidad", fps_d, tot_d, dt,
-                                CANALES_INFO["depth"]["color"])
+                                CANALES_INFO["depth"]["color"], fid_d, ts_d)
                     dibujar_hud(ir2_small, "IR2 (Right)", fps_2, tot_2, dt,
-                                CANALES_INFO["ir2"]["color"])
+                                CANALES_INFO["ir2"]["color"], fid_2, ts_2)
 
                 fila_inferior = np.hstack([ir1_small, depth_small, ir2_small])
                 canvas = np.vstack([f_color, fila_inferior])
@@ -386,13 +509,15 @@ def iniciar_receptor(ip, puerto, mostrar_hud=True):
                 if hud_visible:
                     info = CANALES_INFO[modo]
                     conn, fps, total = estados[modo]
+                    fid, ts = metadatos[modo]
                     dibujar_hud(canvas, f"{info['titulo']} — {info['res']}",
-                                fps, total, dt, info["color"])
+                                fps, total, dt, info["color"], fid, ts)
 
             if canvas is not None:
-                # Barra de estado inferior
+                # Barra de estado inferior con sincronía
                 dibujar_barra_estado(canvas, modo, dt,
-                                     sum(s[1] for s in estados.values()) / 4)
+                                     sum(s[1] for s in estados.values()) / 4,
+                                     sync_texto, sync_ok)
 
                 cv2.imshow(NOMBRE_VENTANA, canvas)
 
@@ -457,7 +582,7 @@ def iniciar_receptor(ip, puerto, mostrar_hud=True):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Receptor RTSP v2 para Intel RealSense D435 — Ubuntu/Linux nativo.",
+        description="Receptor RTSP v3 para Intel RealSense D435 — Ubuntu/Linux nativo con extracción LSB.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Ejemplos:
@@ -471,6 +596,9 @@ Controles en la ventana:
   M → Mosaico (4 vistas)    1 → Color    2 → IR1
   3 → Depth                 4 → IR2      H → HUD on/off
   F → Fullscreen on/off     Q / ESC → Salir
+
+HUD muestra: Frame ID real (LSB), Timestamp del emisor, Latencia,
+             y estado de sincronía entre los 4 canales.
         """
     )
 
@@ -489,7 +617,6 @@ Controles en la ventana:
 
     if args.destino is not None:
         if args.destino.startswith("rtsp://"):
-            # Extraer IP y puerto de una URL RTSP
             sin_proto = args.destino[7:]
             if "/" in sin_proto:
                 host_port = sin_proto.split("/")[0]
