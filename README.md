@@ -1,8 +1,8 @@
 # Demo RTSP — Transmisión de Mosaico RealSense D435 y Grabación Crítica
 
-Sistema de transmisión de vídeo en tiempo real en red local utilizando el protocolo **RTSP** con **Esteganografía LSB (Least Significant Bit)** de 128 bits y **grabación local unificada** en formato Matroska (.mkv) en forma de mosaico de una sola vista.
+Sistema de transmisión de vídeo en tiempo real en red local utilizando el protocolo **RTSP** con **Esteganografía LSB (Least Significant Bit)** de 128 bits y **grabación local unificada** en formato Matroska (.mkv) en forma de mosaico de una sola vista, guardada en la máquina que recibe los archivos (receptor).
 
-El emisor captura 4 streams simultáneos (RGB, Infrarrojos y Profundidad) de una cámara **Intel RealSense D435**, inyecta metadatos síncronos ocultos (Frame ID y marcas de tiempo en nanosegundos) en cada cuadro, los transmite como canales RTSP independientes y el receptor los recibe, mostrando el mosaico y el estado de sincronía real de la red en pantalla.
+El emisor captura 4 streams simultáneos (RGB, Infrarrojos y Profundidad) de una cámara **Intel RealSense D435**, inyecta metadatos síncronos ocultos (Frame ID y marcas de tiempo en nanosegundos) en cada cuadro, los transmite como canales RTSP independientes y el receptor los recibe, mostrando el mosaico, el estado de sincronía real de la red en pantalla y realizando la grabación en disco.
 
 *Para detalles matemáticos, análisis de resiliencia del contenedor Matroska ante fallos de energía y especificación de ingeniería del pipeline, consulte la [Guía Técnica de Esteganografía y Grabación](file:///c:/Users/Luis%20Fdo/Documents/GitHub/Formato-RTSP/DOCUMENTACION_TECNICA.md).*
 
@@ -14,24 +14,35 @@ El emisor captura 4 streams simultáneos (RGB, Infrarrojos y Profundidad) de una
    └──────────────────────────┬─────────────────────────────┘
                               │
                [ Inyección LSB en 4 canales ]
+                              │
+                              ▼
+                 ┌───────────────────────────┐
+                 │ 4 FFmpeg codificando H.264│
+                 └────────────┬──────────────┘
+                              │
+                              ▼
+                 ┌───────────────────────────┐
+                 │ MediaMTX (RTSP Broker)    │
+                 └────────────┬──────────────┘
+                              │ rtsp://<IP>:8554/color,depth,ir1,ir2 (Red Local)
+                              ▼
+                       ┌──────────────┐
+                       │ Receptor OSD │
+                       │   (OpenCV)   │
+                       └──────┬───────┘
+                              │
+               [ Reconstrucción Mosaico en Receptor ]
                               ├──────────────────────────────┐
                               ▼                              ▼
                  ┌───────────────────────────┐  ┌─────────────────────────┐
-                 │ 4 FFmpeg codificando H.264│  │  Construcción Mosaico   │
-                 └────────────┬──────────────┘  │    NumPy 1920x1440      │
-                              │                 └────────────┬────────────┘
-                              ▼                              │ (stdin pipe)
-                 ┌───────────────────────────┐               ▼
-                 │ MediaMTX (RTSP Broker)    │  ┌─────────────────────────┐
-                 └────────────┬──────────────┘  │ 1 FFmpeg local (H.264)  │
-                              │                 └────────────┬────────────┘
-         rtsp://<IP>:8554/color,depth,ir1,ir2                │
-                              │                              ▼
-                              ▼                 ┌─────────────────────────┐
-                       ┌──────────────┐         │  Archivo Matroska .mkv  │
-                       │ Receptor OSD │         └─────────────────────────┘
-                       │   (OpenCV)   │         (Mosaico unificado/Failsafe)
-                       └──────────────┘
+                 │    Ventana de Visualización│  │ 1 FFmpeg local (H.264)  │
+                 └───────────────────────────┘  └────────────┬────────────┘
+                                                             │ (stdin pipe)
+                                                             ▼
+                                                ┌─────────────────────────┐
+                                                │  Archivo Matroska .mkv  │
+                                                └─────────────────────────┘
+                                                (Mosaico unificado/Failsafe)
 ```
 
 ### ¿Qué es RTSP y Esteganografía LSB?
@@ -48,8 +59,8 @@ El emisor captura 4 streams simultáneos (RGB, Infrarrojos y Profundidad) de una
 
 | Componente | Rol | Descripción |
 |------------|-----|-------------|
-| **`emisor.py` / `emisor_ubuntu.py`** | Publicador RTSP y Grabador | Captura flujos nativos, inyecta LSB, los transmite vía RTSP y los graba localmente en un archivo MKV unificado en mosaico 1920×1440. |
-| **`receptor.py` / `receptor_ubuntu.py`** | Cliente RTSP | Conecta a los 4 canales, extrae la esteganografía LSB con votación de mayoría y muestra la visualización interactiva y el HUD de sincronía. |
+| **`emisor.py` / `emisor_ubuntu.py`** | Publicador RTSP | Captura flujos nativos, inyecta LSB y los transmite vía RTSP de manera independiente. También soporta la grabación local de rango sin pérdidas. |
+| **`receptor.py` / `receptor_ubuntu.py`** | Cliente RTSP y Grabador | Conecta a los 4 canales, extrae la esteganografía LSB con votación de mayoría, muestra la visualización interactiva y graba localmente en un archivo MKV unificado en mosaico 1920×1440. |
 | **MediaMTX** | Servidor RTSP (Broker) | Servidor ligero de alta velocidad que gestiona el streaming RTSP. Recibe la publicación de FFmpeg y la retransmite bajo demanda. |
 | **FFmpeg** | Codificador de Vídeo | Codifica en tiempo real los frames crudos en H.264 de ultra baja latencia y escribe el contenedor Matroska. |
 
@@ -211,8 +222,7 @@ Deberías ver algo como:
 [3/5] Abriendo dispositivo Intel RealSense (índice 0) ...
   ✓ Pipeline RealSense iniciado correctamente.
 [4/5] Iniciando transmisión RTSP de 4 canales ...
-[5/5] Grabación local MKV programada (esperando fotogramas activos) ...
-  → Destino: C:\ruta\al\proyecto\grabacion.mkv
+[5/5] Grabación local MKV en emisor: desactivada (se realiza en el receptor)
 
 ═══════════════════════════════════════════════════════════
   ✓ TRANSMISIÓN ACTIVA — 4 Canales RTSP + LSB
@@ -235,11 +245,12 @@ python emisor.py --puerto 8554     # Puerto RTSP (por defecto: 8554)
 python emisor.py --cam 1           # Usar segunda cámara
 python emisor.py --calidad 4000    # Mayor calidad de vídeo (kbps)
 python emisor.py --listar-camaras  # Ver cámaras disponibles
+python emisor.py --grabar-rango 150 450 # Grabar frames sin pérdidas
 ```
 
 ### Paso 3: Ejecuta el receptor (otra máquina)
 
-En la otra computadora, abre PowerShell:
+En la otra computadora (receptora), abre PowerShell:
 
 ```powershell
 cd "C:\ruta\al\proyecto"
@@ -247,10 +258,10 @@ cd "C:\ruta\al\proyecto"
 python receptor.py 192.168.1.42
 ```
 
-O con la URL RTSP completa:
+Si deseas realizar la **grabación del mosaico unificado** en el receptor, utiliza el argumento `--grabar` indicando la ruta del archivo MKV:
 
 ```powershell
-python receptor.py rtsp://192.168.1.42:8554/camara
+python receptor.py 192.168.1.42 --grabar C:\ruta\a\donde\guardar\video.mkv
 ```
 
 Deberías ver:
@@ -260,14 +271,10 @@ Deberías ver:
   RECEPTOR RTSP — Visualización de flujo en tiempo real
 ═══════════════════════════════════════════════════════════
 
-  URL RTSP: rtsp://192.168.1.42:8554/camara
+  URL RTSP: rtsp://192.168.1.42:8554/color (y otros canales)
   Transporte: TCP entrelazado (interleaved)
+  Grabación MKV: C:\ruta\a\donde\guardar\video.mkv
   Presiona 'q' en la ventana para salir.
-
-  [Intento 1] Conectando a rtsp://192.168.1.42:8554/camara ...
-  ✓ Conectado al flujo RTSP
-  Resolución: 640x480
-  FPS del flujo: 30.0
 
   Recibiendo vídeo en tiempo real ...
 ```
@@ -278,8 +285,9 @@ Y una ventana mostrará el vídeo en tiempo real con un indicador de FPS y estad
 
 ```powershell
 python receptor.py 192.168.1.42             # IP con puerto por defecto (8554)
+python receptor.py --grabar 192.168.1.42    # Graba en grabacion.mkv en el receptor
+python receptor.py --grabar C:\ruta.mkv 192.168.1.42 # Graba en la ruta especificada
 python receptor.py 192.168.1.42 9554        # IP con puerto personalizado
-python receptor.py rtsp://IP:PUERTO/camara  # URL RTSP completa
 python receptor.py --sin-hud IP             # Sin overlay de información
 ```
 
@@ -448,8 +456,7 @@ Deberías ver:
   → ir1    1280×720  @ 200kbps  → rtsp://127.0.0.1:8554/ir1
   → ir2    1280×720  @ 200kbps  → rtsp://127.0.0.1:8554/ir2
 
-[6/6] Grabación local MKV programada (esperando fotogramas activos) ...
-  → Destino: /ruta/al/proyecto/grabacion.mkv
+[6/6] Grabación local MKV en emisor: desactivada (se realiza en el receptor)
 
 ══════════════════════════════════════════════════════════════
   ✓ TRANSMISIÓN ACTIVA — 4 Canales RTSP + LSB
@@ -476,6 +483,7 @@ python3 emisor_ubuntu.py --cam 1             # Segunda cámara
 python3 emisor_ubuntu.py --calidad 4000      # Mayor calidad (kbps)
 python3 emisor_ubuntu.py --listar-camaras    # Ver cámaras RealSense
 python3 emisor_ubuntu.py --diagnostico       # Diagnóstico completo
+python3 emisor_ubuntu.py --grabar-rango 150 450 # Grabar frames sin pérdidas
 ```
 
 ### Paso 2: Ejecutar el receptor (otra máquina o terminal)
@@ -488,17 +496,24 @@ source .venv/bin/activate
 python3 receptor_ubuntu.py 192.168.1.42
 ```
 
+Si deseas realizar la **grabación del mosaico unificado** en el receptor, utiliza el argumento `--grabar` indicando la ruta del archivo MKV:
+
+```bash
+python3 receptor_ubuntu.py 192.168.1.42 --grabar /ruta/a/donde/guardar/video.mkv
+```
+
 El receptor se conectará a los 4 canales y mostrará un mosaico interactivo:
 
 ```
 ══════════════════════════════════════════════════════════════
-  RECEPTOR RTSP — RealSense D435 · Ubuntu Nativo (v2)
+  RECEPTOR RTSP — RealSense D435 · Ubuntu Nativo (v3)
 ══════════════════════════════════════════════════════════════
   color  → rtsp://192.168.1.42:8554/color
   depth  → rtsp://192.168.1.42:8554/depth
   ir1    → rtsp://192.168.1.42:8554/ir1
   ir2    → rtsp://192.168.1.42:8554/ir2
 ──────────────────────────────────────────────────────────────
+  Grabación MKV: /ruta/a/donde/guardar/video.mkv
   Controles: [M]osaico [1]Color [2]IR1 [3]Depth [4]IR2
              [H]UD on/off  [F]ullscreen  [Q]Salir
 ══════════════════════════════════════════════════════════════
@@ -521,8 +536,9 @@ El receptor se conectará a los 4 canales y mostrará un mosaico interactivo:
 
 ```bash
 python3 receptor_ubuntu.py 192.168.1.42             # IP con puerto defecto (8554)
+python3 receptor_ubuntu.py --grabar 192.168.1.42    # Graba en grabacion.mkv en el receptor
+python3 receptor_ubuntu.py --grabar /ruta/video.mkv 192.168.1.42 # Graba en la ruta especificada
 python3 receptor_ubuntu.py 192.168.1.42 9554        # Puerto personalizado
-python3 receptor_ubuntu.py rtsp://IP:PUERTO/color   # URL RTSP completa
 python3 receptor_ubuntu.py --sin-hud 192.168.1.42   # Sin overlay de info
 python3 receptor_ubuntu.py 127.0.0.1                # Prueba local
 ```

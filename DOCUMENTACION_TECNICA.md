@@ -67,7 +67,7 @@ Al utilizar un **mosaico de una sola vista físico de 1920×1440**:
 
 ## 3. Pipeline de Escritura y FFmpeg en Tiempo Real
 
-El pipeline de transmisión y grabación se ha diseñado para evitar escrituras temporales en disco y llamadas a Named Pipes bloqueantes en sistemas Windows y Linux, unificando la arquitectura mediante el paso directo de descriptores de tuberías (`stdin` de procesos hijo en Python).
+El pipeline de transmisión y grabación se ha diseñado para evitar escrituras temporales en disco y llamadas a Named Pipes bloqueantes, unificando la arquitectura mediante el paso directo de descriptores de tuberías (`stdin` de procesos hijo en Python). La grabación del mosaico unificado ocurre en el receptor tras recibir los flujos de red:
 
 ```
    ┌────────────────────────────────────────────────────────┐
@@ -77,35 +77,49 @@ El pipeline de transmisión y grabación se ha diseñado para evitar escrituras 
                [ Inyección LSB en 4 canales ]
                               │
                               ▼
-        ┌───────────────────────────────────────────┐
-        │  Construcción Mosaico NumPy BGR 1920x1440 │
-        └─────────────────────┬─────────────────────┘
+                 ┌───────────────────────────┐
+                 │ 4 FFmpeg codificando H.264│
+                 └────────────┬──────────────┘
+                              │ (Publicación RTSP)
+                              ▼
+                 ┌───────────────────────────┐
+                 │ MediaMTX (RTSP Broker)    │
+                 └────────────┬──────────────┘
+                              │ (Transmisión de Red)
+                              ▼
+                       ┌──────────────┐
+                       │ Receptor OSD │
+                       └──────┬───────┘
+                              │
+         ┌────────────────────┴─────────────────────┐
+         │  Construcción Mosaico NumPy BGR 1920x1440 │
+         └────────────────────┬─────────────────────┘
                               │
                        [ Write raw bytes ]
                               ▼
-                ┌───────────────────────────┐
-                │ stdin Proceso Hijo FFmpeg │
-                └─────────────┬─────────────┘
-                              │
-               [ Codificación libx264 preset ultrafast ]
-                              ▼
-                 ┌─────────────────────────┐
-                 │  Archivo Matroska .mkv  │
-                 └─────────────────────────┘
+                 ┌───────────────────────────┐
+                 │ stdin Proceso Hijo FFmpeg │
+                 └─────────────┬─────────────┘
+                               │
+                [ Codificación libx264 preset ultrafast ]
+                               ▼
+                  ┌─────────────────────────┐
+                  │  Archivo Matroska .mkv  │
+                  └─────────────────────────┘
 ```
 
 ### 3.1 Comando FFmpeg para Escritura del Mosaico
-El comando que ejecuta el emisor en segundo plano de manera síncrona es:
+El comando que ejecuta el receptor en segundo plano de manera síncrona es:
 
 ```bash
 ffmpeg -y -f rawvideo -pix_fmt bgr24 -s 1920x1440 -r 30 -i - \
   -c:v libx264 -pix_fmt yuv420p -preset ultrafast -crf 18 \
-  -metadata title="RealSense D435 Mosaico LSB" -f matroska grabacion.mkv
+  -metadata title="RealSense D435 Mosaico LSB (Receptor)" -f matroska grabacion.mkv
 ```
 
-*   `-f rawvideo -pix_fmt bgr24 -s 1920x1440 -r 30 -i -`: Configura el canal de entrada para aceptar bytes de imagen crudos de OpenCV a 30 FPS.
-*   `-c:v libx264 -preset ultrafast -crf 18`: Habilita codificación por hardware o software H.264 eficiente de baja latencia con factor de calidad constante (CRF) 18, garantizando que los bits LSB inyectados sobrevivan la codificación sin pérdidas perceptibles de datos.
-*   `-f matroska`: Emite directamente al contenedor resiliente Matroska.
+*   `-f rawvideo -pix_fmt bgr24 -s 1920x1440 -r 30 -i -`: Configura el canal de entrada del receptor para aceptar bytes de imagen crudos de OpenCV a 30 FPS.
+*   `-c:v libx264 -preset ultrafast -crf 18`: Habilita codificación H.264 eficiente de baja latencia con factor de calidad constante (CRF) 18, garantizando que los bits LSB inyectados sobrevivan la codificación sin pérdidas perceptibles de datos.
+*   `-f matroska`: Emite directamente al contenedor resiliente Matroska en la máquina receptora.
 
 ---
 
@@ -128,15 +142,11 @@ sudo udevadm control --reload-rules && sudo udevadm trigger
 *Desconectar y reconectar la cámara posterior a este comando.*
 
 #### Ejecución del Emisor
-1.  **Sin Grabación Local:**
+1.  **Ejecución General:**
     ```bash
     python3 emisor_ubuntu.py
     ```
-2.  **Con Grabación del Mosaico Unificado Activa:**
-    ```bash
-    python3 emisor_ubuntu.py --grabar /ruta/al/video.mkv
-    ```
-3.  **Ejecutar Diagnóstico Completo:**
+2.  **Ejecutar Diagnóstico Completo:**
     ```bash
     python3 emisor_ubuntu.py --diagnostico
     ```
@@ -148,7 +158,7 @@ sudo udevadm control --reload-rules && sudo udevadm trigger
 #### Requisitos en Windows
 Asegurar tener instalado Python 3.8+ y las dependencias vía PowerShell:
 ```powershell
-pip install opencv-python numpy
+pip install opencv-python numpy imageio-ffmpeg
 ```
 
 #### Ejecución del Receptor
@@ -159,6 +169,15 @@ python receptor.py 192.168.1.42
 
 # Ubuntu
 python3 receptor_ubuntu.py 192.168.1.42
+```
+
+Si desea realizar la **grabación del mosaico unificado** en el receptor, utilice el argumento `--grabar` indicando la ruta del archivo MKV:
+```bash
+# Windows (graba en grabacion.mkv o en ruta específica)
+python receptor.py --grabar C:\ruta\video.mkv 192.168.1.42
+
+# Ubuntu (graba en grabacion.mkv o en ruta específica)
+python3 receptor_ubuntu.py --grabar /ruta/video.mkv 192.168.1.42
 ```
 
 Si el servidor utiliza un puerto diferente a `8554`, añada el argumento:

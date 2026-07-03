@@ -31,6 +31,7 @@ import os
 import threading
 import struct
 import datetime
+import subprocess
 
 # ─── Configurar la codificación de la consola para Unicode en Windows ─────
 if sys.platform.startswith("win"):
@@ -49,6 +50,11 @@ except ImportError:
     print("  Instálalo con:  pip install -r requirements.txt")
     sys.exit(1)
 
+try:
+    import imageio_ffmpeg
+except ImportError:
+    imageio_ffmpeg = None
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # CONSTANTES Y CONFIGURACIÓN
@@ -56,6 +62,99 @@ except ImportError:
 
 PUERTO_RTSP_DEFECTO = 8554
 NOMBRE_VENTANA = "Receptor RTSP — RealSense D435 (v3 · LSB)"
+
+MOSAICO_ANCHO = 1920
+MOSAICO_ALTO = 1440
+
+_CREATION_FLAGS = subprocess.CREATE_NO_WINDOW if sys.platform.startswith("win") else 0
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PIPELINE DE GRABACIÓN MKV (RECEPTOR)
+# ═══════════════════════════════════════════════════════════════════════════
+
+def obtener_ruta_ffmpeg():
+    """Obtiene la ruta al ejecutable de FFmpeg usando imageio-ffmpeg."""
+    if imageio_ffmpeg is None:
+        return None
+    try:
+        ruta = imageio_ffmpeg.get_ffmpeg_exe()
+        resultado = subprocess.run(
+            [ruta, "-version"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            creationflags=_CREATION_FLAGS
+        )
+        if resultado.returncode == 0:
+            return ruta
+        return None
+    except Exception:
+        return None
+
+
+def construir_mosaico(color_img, depth_color, ir1_img, ir2_img, cv2_mod):
+    """
+    Fusiona los 4 frames en un mosaico unificado de 1920x1440.
+    """
+    ir1_small = cv2_mod.resize(ir1_img, (640, 360), interpolation=cv2_mod.INTER_LINEAR)
+    depth_small = cv2_mod.resize(depth_color, (640, 360), interpolation=cv2_mod.INTER_LINEAR)
+    ir2_small = cv2_mod.resize(ir2_img, (640, 360), interpolation=cv2_mod.INTER_LINEAR)
+
+    if ir1_small.ndim == 2:
+        ir1_small = cv2_mod.cvtColor(ir1_small, cv2_mod.COLOR_GRAY2BGR)
+    if ir2_small.ndim == 2:
+        ir2_small = cv2_mod.cvtColor(ir2_small, cv2_mod.COLOR_GRAY2BGR)
+
+    fila_inferior = np.hstack([ir1_small, depth_small, ir2_small])
+    mosaico = np.vstack([color_img, fila_inferior])
+    return mosaico
+
+
+def crear_grabacion_mosaico_mkv(ruta_ffmpeg, ruta_mkv, fps=30):
+    """
+    Crea el pipeline de grabación local MKV con mosaico unificado.
+    Recibe rawvideo BGR24 de 1920x1440 por stdin y codifica a Matroska (.mkv).
+    """
+    cmd = [
+        ruta_ffmpeg,
+        "-y",
+        "-f", "rawvideo",
+        "-pix_fmt", "bgr24",
+        "-s", f"{MOSAICO_ANCHO}x{MOSAICO_ALTO}",
+        "-r", str(fps),
+        "-i", "-",
+        "-c:v", "libx264",
+        "-pix_fmt", "yuv420p",
+        "-preset", "ultrafast",
+        "-crf", "18",
+        "-metadata", "title=RealSense D435 Mosaico LSB (Receptor)",
+        "-metadata", "comment=Layout: Color 1920x1080 + IR1/Depth/IR2 640x360",
+        "-f", "matroska",
+        ruta_mkv
+    ]
+
+    print(f"  → Lanzando FFmpeg de grabación MKV (mosaico {MOSAICO_ANCHO}×{MOSAICO_ALTO}) ...")
+    try:
+        proceso = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            creationflags=_CREATION_FLAGS
+        )
+    except Exception as e:
+        print(f"  ✗ Error al lanzar FFmpeg de grabación: {e}")
+        return None
+
+    time.sleep(0.3)
+    if proceso.poll() is not None:
+        stderr_out = proceso.stderr.read().decode(errors="replace")[:500]
+        print(f"  ✗ FFmpeg de grabación terminó inesperadamente:")
+        print(f"    {stderr_out}")
+        return None
+
+    print(f"  ✓ Pipeline de grabación MKV activo → {ruta_mkv}")
+    return proceso
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -353,7 +452,7 @@ def letterbox(frame, ancho_ventana, alto_ventana):
 # FUNCIÓN PRINCIPAL DEL RECEPTOR
 # ═══════════════════════════════════════════════════════════════════════════
 
-def iniciar_receptor(url_base_ip, puerto, mostrar_hud_info=True):
+def iniciar_receptor(url_base_ip, puerto, mostrar_hud_info=True, ruta_grabacion=None):
     """
     Receptor RTSP v3 con extracción LSB para Windows.
     Se conecta a 4 streams independientes, extrae metadatos LSB ocultos
@@ -399,6 +498,24 @@ def iniciar_receptor(url_base_ip, puerto, mostrar_hud_info=True):
     pantalla_completa = False
     tiempo_inicio = time.time()
     ultimo_log_conexion = 0
+
+    # Estado de grabación
+    grabando = False
+    proceso_grab = None
+    grabacion_pendiente = False
+    ruta_ffmpeg = None
+
+    if ruta_grabacion:
+        print(f"\n  [Grabación] Grabación local MKV programada ...")
+        print(f"    → Destino: {os.path.abspath(ruta_grabacion)}")
+        if imageio_ffmpeg is None:
+            print("    ⚠ Error: imageio-ffmpeg no está instalado. No se podrá grabar.")
+        else:
+            ruta_ffmpeg = obtener_ruta_ffmpeg()
+            if ruta_ffmpeg is None:
+                print("    ⚠ Error: no se encontró un ejecutable de FFmpeg válido.")
+            else:
+                grabacion_pendiente = True
 
     try:
         while True:
@@ -462,6 +579,34 @@ def iniciar_receptor(url_base_ip, puerto, mostrar_hud_info=True):
                 frame_ir1 = cv2.cvtColor(frame_ir1, cv2.COLOR_GRAY2BGR)
             if len(frame_ir2.shape) == 2 or frame_ir2.shape[2] == 1:
                 frame_ir2 = cv2.cvtColor(frame_ir2, cv2.COLOR_GRAY2BGR)
+
+            # ─── Grabación Mosaico (Antes de dibujar HUD) ───
+            if (grabacion_pendiente or grabando) and ruta_ffmpeg:
+                # Comprobamos si los 4 streams están entregando frames válidos
+                canales_listos = (reader_color.get_frame() is not None and
+                                  reader_depth.get_frame() is not None and
+                                  reader_ir1.get_frame() is not None and
+                                  reader_ir2.get_frame() is not None)
+                if canales_listos:
+                    if grabacion_pendiente and not grabando:
+                        proceso_grab = crear_grabacion_mosaico_mkv(ruta_ffmpeg, ruta_grabacion, fps=30)
+                        if proceso_grab is not None:
+                            grabando = True
+                            grabacion_pendiente = False
+                            print(f"  🔴 GRABACIÓN MOSAICO INICIADA → {os.path.abspath(ruta_grabacion)}")
+                        else:
+                            grabando = False
+                            grabacion_pendiente = False
+                    
+                    if grabando:
+                        try:
+                            # Hacemos una copia local de los frames limpios para el mosaico de la grabación
+                            mosaico = construir_mosaico(frame_color.copy(), frame_depth.copy(),
+                                                        frame_ir1.copy(), frame_ir2.copy(), cv2)
+                            proceso_grab.stdin.write(mosaico.tobytes())
+                        except (BrokenPipeError, OSError) as e:
+                            print(f"  ⚠ Error al escribir en grabación MKV: {e}")
+                            grabando = False
 
             # ─── Componer visualización ───
             canvas_mostrar = None
@@ -618,6 +763,23 @@ def iniciar_receptor(url_base_ip, puerto, mostrar_hud_info=True):
         reader_ir1.stop()
         reader_ir2.stop()
         cv2.destroyAllWindows()
+        
+        # Detener grabador mosaico
+        if proceso_grab:
+            try:
+                if proceso_grab.stdin:
+                    proceso_grab.stdin.close()
+            except Exception:
+                pass
+            try:
+                proceso_grab.wait(timeout=5)
+                print(f"  ✓ Grabación MKV finalizada → {ruta_grabacion}")
+            except subprocess.TimeoutExpired:
+                proceso_grab.kill()
+                print("  ⚠ FFmpeg de grabación forzado a detener")
+            except Exception:
+                pass
+                
         print("  ✓ Hilos detenidos y recursos liberados.")
         print("\n  Receptor finalizado.\n")
 
@@ -636,6 +798,8 @@ Ejemplos de uso:
   python receptor.py 192.168.1.42 8554                    # IP y puerto
   python receptor.py rtsp://192.168.1.42:8554/color       # URL directa
   python receptor.py --sin-hud 192.168.1.42               # Sin overlay
+  python receptor.py --grabar 192.168.1.42                # Graba en grabacion.mkv
+  python receptor.py --grabar video.mkv 192.168.1.42      # Graba en ruta específica
 
 Controles en la ventana:
   M → Mosaico    1 → Color   2 → IR1    3 → Depth   4 → IR2
@@ -652,6 +816,9 @@ HUD muestra: Frame ID real (LSB), Timestamp del emisor, Latencia,
                         help=f"Puerto del servidor RTSP (por defecto: {PUERTO_RTSP_DEFECTO})")
     parser.add_argument("--sin-hud", action="store_true",
                         help="No mostrar información de estado (HUD) sobre el vídeo")
+    parser.add_argument("--grabar", nargs="?", const="grabacion.mkv", default=None,
+                        metavar="RUTA.mkv",
+                        help="Grabar mosaico unificado en archivo MKV (defecto: grabacion.mkv)")
 
     args = parser.parse_args()
 
@@ -678,4 +845,4 @@ HUD muestra: Frame ID real (LSB), Timestamp del emisor, Latencia,
         else:
             ip_destino = args.destino
 
-    iniciar_receptor(ip_destino, puerto_destino, mostrar_hud_info=not args.sin_hud)
+    iniciar_receptor(ip_destino, puerto_destino, mostrar_hud_info=not args.sin_hud, ruta_grabacion=args.grabar)
