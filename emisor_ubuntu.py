@@ -1,34 +1,22 @@
 #!/usr/bin/env python3
 """
-Emisor RTSP para Intel RealSense D435 — Ubuntu/Linux Nativo (v3).
+Emisor RTSP para Intel RealSense D435 — Ubuntu/Linux Nativo (v4).
 
 Arquitectura de grabación y streaming con esteganografía LSB:
   - Inyecta Frame ID (64 bits) + Timestamp (64 bits) en cada frame vía LSB
-  - Soporta grabación local en Matroska (.mkv) como mosaico unificado (--grabar)
-  - Usa un solo pipe stdin para la grabación (sin FIFOs)
+  - Usa FFmpeg como servidor RTSP directo (sin MediaMTX)
+  - Soporta grabación local de rango sin pérdidas (--grabar-rango)
   - Mantiene compatibilidad total con señales POSIX y cierre limpio
 
-Publica 4 streams RTSP independientes:
-  rtsp://<IP>:8554/color    — RGB 1920x1080
-  rtsp://<IP>:8554/depth    — Profundidad con heatmap JET 1280x720
-  rtsp://<IP>:8554/ir1      — Infrarrojo izquierdo 1280x720
-  rtsp://<IP>:8554/ir2      — Infrarrojo derecho 1280x720
-
-Grabación MKV (--grabar):
-  Fusiona los 4 canales (con LSB inyectado) en un mosaico unificado
-  de 1920x1440 y lo escribe en tiempo real a un archivo Matroska (.mkv).
-  El layout del mosaico es idéntico al del receptor:
-    ┌──────────────────────────────┐
-    │           Color              │
-    │        1920 × 1080           │
-    ├──────────┬──────────┬────────┤
-    │   IR1    │  Depth   │  IR2   │
-    │ 640×360  │ 640×360  │ 640×360│
-    └──────────┴──────────┴────────┘
+Publica 4 streams RTSP independientes (un puerto por canal):
+  rtsp://<IP>:8554/stream   — RGB 1920x1080
+  rtsp://<IP>:8555/stream   — Profundidad con heatmap JET 1280x720
+  rtsp://<IP>:8556/stream   — Infrarrojo izquierdo 1280x720
+  rtsp://<IP>:8557/stream   — Infrarrojo derecho 1280x720
 
 Uso:
     python3 emisor_ubuntu.py [--puerto PUERTO] [--cam INDICE] [--calidad KBPS]
-    python3 emisor_ubuntu.py --grabar [RUTA.mkv]
+    python3 emisor_ubuntu.py --grabar-rango INICIO FIN
     python3 emisor_ubuntu.py --listar-camaras
     python3 emisor_ubuntu.py --diagnostico
 """
@@ -39,12 +27,8 @@ import os
 import signal
 import time
 import argparse
-import tarfile
-import stat
 import socket
 import shutil
-import urllib.request
-import glob
 import struct
 import queue
 import threading
@@ -64,9 +48,6 @@ except ImportError:
 # ═══════════════════════════════════════════════════════════════════════════
 
 PUERTO_RTSP_DEFECTO = 8554
-DIR_BASE = os.path.dirname(os.path.abspath(__file__))
-DIR_MEDIAMTX = os.path.join(DIR_BASE, "mediamtx_linux")
-MEDIAMTX_VERSION = "v1.12.2"
 
 # ─── Flag global para cierre limpio con señales POSIX ───────────────────
 # Se activa cuando se recibe SIGINT (Ctrl+C) o SIGTERM para que el bucle
@@ -296,25 +277,6 @@ class GrabadorRango:
 # DETECCIÓN DE DEPENDENCIAS (Linux-native)
 # ═══════════════════════════════════════════════════════════════════════════
 
-def detectar_arquitectura():
-    """Detecta la arquitectura del CPU para descargar el binario correcto de MediaMTX."""
-    try:
-        resultado = subprocess.run(["uname", "-m"], capture_output=True, text=True)
-        arch = resultado.stdout.strip().lower()
-    except Exception:
-        arch = "x86_64"
-
-    mapa = {
-        "x86_64": "amd64",
-        "amd64": "amd64",
-        "aarch64": "arm64v8",
-        "arm64": "arm64v8",
-        "armv7l": "armv7",
-        "armhf": "armv7",
-    }
-    return mapa.get(arch, "amd64"), arch
-
-
 def buscar_ffmpeg():
     """
     Busca FFmpeg en el sistema. Prioriza el binario del sistema operativo
@@ -440,20 +402,16 @@ def ejecutar_diagnostico():
     print("  DIAGNÓSTICO DEL SISTEMA — Emisor RTSP Ubuntu")
     print("═" * 60)
 
-    # 1. Arquitectura
-    arch_mtx, arch_raw = detectar_arquitectura()
-    print(f"\n  [CPU] Arquitectura: {arch_raw} → MediaMTX: {arch_mtx}")
-
-    # 2. FFmpeg
+    # 1. FFmpeg
     ruta_ff, origen_ff = buscar_ffmpeg()
     if ruta_ff:
-        print(f"  [✓] FFmpeg encontrado: {ruta_ff}")
+        print(f"\n  [✓] FFmpeg encontrado: {ruta_ff}")
         print(f"      Origen: {origen_ff}")
     else:
-        print("  [✗] FFmpeg NO encontrado")
+        print("\n  [✗] FFmpeg NO encontrado")
         print("      Instalar con: sudo apt install ffmpeg")
 
-    # 3. Python / OpenCV / numpy
+    # 2. Python / OpenCV / numpy
     cv2 = verificar_opencv()
     _np = verificar_numpy()
     rs = verificar_pyrealsense2()
@@ -476,7 +434,7 @@ def ejecutar_diagnostico():
         print("          sudo apt install librealsense2-dkms librealsense2-utils")
         print("          pip install pyrealsense2")
 
-    # 4. Reglas udev
+    # 3. Reglas udev
     udev_ok, udev_ruta = verificar_reglas_udev()
     if udev_ok:
         print(f"  [✓] Reglas udev: {udev_ruta}")
@@ -488,7 +446,7 @@ def ejecutar_diagnostico():
         print("        sudo cp 99-realsense-libusb.rules /etc/udev/rules.d/")
         print("        sudo udevadm control --reload-rules && sudo udevadm trigger")
 
-    # 5. Dispositivos USB
+    # 4. Dispositivos USB
     dispositivos = verificar_dispositivos_usb()
     if dispositivos:
         print(f"  [✓] Dispositivo(s) RealSense en USB: {len(dispositivos)}")
@@ -498,119 +456,18 @@ def ejecutar_diagnostico():
         print("  [⚠] No se detectaron dispositivos RealSense en el bus USB")
         print("      Verifica que la cámara esté conectada a un puerto USB 3.0")
 
-    # 6. Puerto RTSP
-    puerto_libre = verificar_puerto_disponible(PUERTO_RTSP_DEFECTO)
-    if puerto_libre:
-        print(f"  [✓] Puerto {PUERTO_RTSP_DEFECTO} disponible")
-    else:
-        print(f"  [✗] Puerto {PUERTO_RTSP_DEFECTO} EN USO")
-        print(f"      Usa --puerto OTRO_PUERTO o mata el proceso que lo ocupa")
-
-    # 7. MediaMTX
-    exe_mtx = os.path.join(DIR_MEDIAMTX, "mediamtx")
-    if os.path.isfile(exe_mtx) and os.access(exe_mtx, os.X_OK):
-        print(f"  [✓] MediaMTX instalado: {exe_mtx}")
-    elif os.path.isfile(exe_mtx):
-        print(f"  [⚠] MediaMTX existe pero sin permiso de ejecución: {exe_mtx}")
-        print(f"      Ejecutar: chmod +x {exe_mtx}")
-    else:
-        print(f"  [i] MediaMTX no descargado aún (se descargará al ejecutar el emisor)")
+    # 5. Puertos RTSP (4 puertos consecutivos)
+    puerto_base = PUERTO_RTSP_DEFECTO
+    for i, nombre in enumerate(["color", "depth", "ir1", "ir2"]):
+        p = puerto_base + i
+        libre = verificar_puerto_disponible(p)
+        if libre:
+            print(f"  [✓] Puerto {p} ({nombre}) disponible")
+        else:
+            print(f"  [✗] Puerto {p} ({nombre}) EN USO")
+            print(f"      Usa --puerto OTRO_PUERTO o mata el proceso que lo ocupa")
 
     print("\n" + "═" * 60 + "\n")
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# MEDIAMTX
-# ═══════════════════════════════════════════════════════════════════════════
-
-def descargar_mediamtx():
-    """Descarga y extrae MediaMTX para Linux. Retorna ruta al ejecutable."""
-    exe_path = os.path.join(DIR_MEDIAMTX, "mediamtx")
-
-    if os.path.isfile(exe_path) and os.access(exe_path, os.X_OK):
-        print(f"  ✓ MediaMTX ya instalado: {exe_path}")
-        return exe_path
-
-    arch_mtx, arch_raw = detectar_arquitectura()
-    url = (
-        f"https://github.com/bluenviron/mediamtx/releases/download/"
-        f"{MEDIAMTX_VERSION}/mediamtx_{MEDIAMTX_VERSION}_linux_{arch_mtx}.tar.gz"
-    )
-
-    print(f"  ↓ Descargando MediaMTX {MEDIAMTX_VERSION} (linux/{arch_mtx}) ...")
-    os.makedirs(DIR_MEDIAMTX, exist_ok=True)
-    tar_path = os.path.join(DIR_MEDIAMTX, "mediamtx.tar.gz")
-
-    try:
-        urllib.request.urlretrieve(url, tar_path)
-    except Exception as e:
-        print(f"  ✗ Error al descargar MediaMTX: {e}")
-        print(f"    URL: {url}")
-        print(f"    Verifica tu conexión a internet.")
-        sys.exit(1)
-
-    print("  ↓ Extrayendo ...")
-    try:
-        with tarfile.open(tar_path, "r:gz") as tar:
-            tar.extractall(DIR_MEDIAMTX)
-    except tarfile.TarError as e:
-        print(f"  ✗ Error al extraer: {e}")
-        os.remove(tar_path)
-        sys.exit(1)
-
-    os.remove(tar_path)
-
-    if not os.path.isfile(exe_path):
-        print("  ✗ Binario 'mediamtx' no encontrado tras la extracción.")
-        sys.exit(1)
-
-    # Asegurar permisos de ejecución
-    os.chmod(exe_path, os.stat(exe_path).st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
-    print(f"  ✓ MediaMTX instalado: {exe_path}")
-    return exe_path
-
-
-def iniciar_mediamtx(puerto):
-    """Inicia MediaMTX y retorna el proceso."""
-    exe_path = descargar_mediamtx()
-
-    # Verificar que el puerto esté libre
-    if not verificar_puerto_disponible(puerto):
-        print(f"  ✗ El puerto {puerto} ya está en uso.")
-        print(f"    Usa --puerto OTRO o mata el proceso que lo ocupa:")
-        print(f"    sudo lsof -i :{puerto}")
-        sys.exit(1)
-
-    entorno = os.environ.copy()
-    entorno["MTX_RTSPADDRESS"] = f":{puerto}"
-
-    print(f"  → Iniciando MediaMTX en :{puerto} ...")
-    try:
-        proceso = subprocess.Popen(
-            [exe_path],
-            cwd=DIR_MEDIAMTX,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            env=entorno
-        )
-    except PermissionError:
-        print(f"  ✗ Sin permisos de ejecución.")
-        print(f"    Ejecuta: chmod +x {exe_path}")
-        sys.exit(1)
-    except Exception as e:
-        print(f"  ✗ Error al iniciar MediaMTX: {e}")
-        sys.exit(1)
-
-    # Esperar a que arranque (verificar que no muera de inmediato)
-    time.sleep(2)
-    if proceso.poll() is not None:
-        salida = proceso.stdout.read().decode(errors="replace")[:500]
-        print(f"  ✗ MediaMTX terminó inesperadamente:")
-        print(f"    {salida}")
-        sys.exit(1)
-
-    print(f"  ✓ MediaMTX corriendo (PID {proceso.pid})")
-    return proceso
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -662,17 +519,17 @@ def obtener_ip_local():
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# PROCESOS FFMPEG — RTSP
+# PROCESOS FFMPEG — RTSP SERVER DIRECTO
 # ═══════════════════════════════════════════════════════════════════════════
 
-def crear_ffmpeg(ruta_ffmpeg, url_rtsp, ancho, alto, pix_fmt, fps, bitrate_kbps):
+def crear_ffmpeg(ruta_ffmpeg, puerto_listen, ancho, alto, pix_fmt, fps, bitrate_kbps):
     """
-    Lanza un subproceso FFmpeg para codificar rawvideo → H.264 → RTSP.
+    Lanza un subproceso FFmpeg como servidor RTSP directo (sin MediaMTX).
 
-    Cada canal de la cámara (Color, Depth, IR1, IR2) tiene su propio proceso
-    FFmpeg independiente que codifica los frames crudos en H.264 con el preset
-    ultrafast y los publica vía RTSP/TCP al servidor MediaMTX local.
+    FFmpeg abre un socket TCP en el puerto indicado y espera conexiones
+    RTSP entrantes. El receptor se conecta directamente a este puerto.
     """
+    url_listen = f"rtsp://0.0.0.0:{puerto_listen}/stream"
     cmd = [
         ruta_ffmpeg,
         "-y",
@@ -692,7 +549,8 @@ def crear_ffmpeg(ruta_ffmpeg, url_rtsp, ancho, alto, pix_fmt, fps, bitrate_kbps)
         "-g", str(fps * 2),                 # GOP de 2 segundos
         "-f", "rtsp",
         "-rtsp_transport", "tcp",
-        url_rtsp,
+        "-rtsp_flags", "listen",
+        url_listen,
     ]
     return subprocess.Popen(
         cmd,
@@ -703,28 +561,6 @@ def crear_ffmpeg(ruta_ffmpeg, url_rtsp, ancho, alto, pix_fmt, fps, bitrate_kbps)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# GRABACIÓN MKV — MOSAICO UNIFICADO
-# ═══════════════════════════════════════════════════════════════════════════
-#
-# A diferencia de la v2 que usaba 4 Named Pipes (FIFOs) para alimentar 4 tracks
-# independientes dentro del MKV, esta v3 fusiona los 4 canales en un ÚNICO
-# mosaico de 1920×1440 y lo graba como un solo stream de video.
-#
-# Ventajas del mosaico unificado:
-#   1. Un solo pipe stdin → un solo track → pipeline drásticamente más simple
-#   2. Si hay drop de frames, la caída afecta simétricamente a los 4 cuadrantes
-#      (imposible tener desfases temporales entre cámaras)
-#   3. Elimina los FIFOs (/tmp/rtsp_grab_*) y sus riesgos de deadlock
-#   4. El archivo MKV se puede reproducir en cualquier reproductor estándar
-#
-# ¿Por qué Matroska (.mkv)?
-#   Matroska usa una estructura de clusters/bloques que se escribe
-#   incrementalmente. A diferencia de MP4 (que necesita un átomo 'moov'
-#   al final del archivo), MKV es reproducible hasta el último cluster
-#   escrito incluso si el proceso muere abruptamente (corte de luz,
-#   kill -9, etc.). El video guardado hasta ese milisegundo NO se corrompe.
-
-# ═══════════════════════════════════════════════════════════════════════════
 # FUNCIÓN PRINCIPAL DEL EMISOR
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -732,16 +568,24 @@ def iniciar_emisor(indice_camara=0, puerto=PUERTO_RTSP_DEFECTO,
                    bitrate_kbps=2000,
                    rango_grabacion=None, dir_salida=None):
     """
-    Emisor RTSP v3: captura 4 canales de RealSense D435, inyecta metadatos
-    LSB (Frame ID + Timestamp) y los publica como streams RTSP independientes.
+    Emisor RTSP v4: captura 4 canales de RealSense D435, inyecta metadatos
+    LSB (Frame ID + Timestamp) y los publica como streams RTSP independientes
+    usando FFmpeg como servidor RTSP directo (sin MediaMTX).
 
     Opcionalmente graba un rango de fotogramas sin pérdidas.
     """
     global _cerrando
-    proceso_mediamtx = None
     procesos_ff = {}         # {"color": Popen, "depth": Popen, ...}
     pipeline = None
     pipeline_activo = False
+
+    # Puertos: base para color, base+1 depth, base+2 ir1, base+3 ir2
+    puertos = {
+        "color": puerto,
+        "depth": puerto + 1,
+        "ir1":   puerto + 2,
+        "ir2":   puerto + 3,
+    }
 
     # ─── Registrar señales POSIX para cierre limpio ─────────────────────
     # SIGINT se recibe con Ctrl+C. SIGTERM se recibe al hacer kill <PID>.
@@ -758,14 +602,14 @@ def iniciar_emisor(indice_camara=0, puerto=PUERTO_RTSP_DEFECTO,
 
     try:
         print("\n" + "═" * 62)
-        print("  EMISOR RTSP — Intel RealSense D435 · Ubuntu Nativo (v3)")
-        print("  Esteganografía LSB activa · Bloques de 8px por bit")
+        print("  EMISOR RTSP — Intel RealSense D435 · Ubuntu Nativo (v4)")
+        print("  Esteganografía LSB activa · FFmpeg RTSP Server directo")
         print("═" * 62)
 
         # ──────────────────────────────────────────────────────────────
         # PASO 1: Verificar FFmpeg
         # ──────────────────────────────────────────────────────────────
-        print("\n[1/6] Buscando FFmpeg ...")
+        print("\n[1/5] Buscando FFmpeg ...")
         ruta_ffmpeg, origen = buscar_ffmpeg()
         if ruta_ffmpeg is None:
             print("  ✗ FFmpeg no encontrado en el sistema.")
@@ -777,7 +621,7 @@ def iniciar_emisor(indice_camara=0, puerto=PUERTO_RTSP_DEFECTO,
         # ──────────────────────────────────────────────────────────────
         # PASO 2: Verificar dependencias Python
         # ──────────────────────────────────────────────────────────────
-        print("\n[2/6] Verificando dependencias Python ...")
+        print("\n[2/5] Verificando dependencias Python ...")
 
         cv2 = verificar_opencv()
         if cv2 is None:
@@ -815,15 +659,9 @@ def iniciar_emisor(indice_camara=0, puerto=PUERTO_RTSP_DEFECTO,
             print(f"  ✓ Reglas udev: {udev_ruta}")
 
         # ──────────────────────────────────────────────────────────────
-        # PASO 3: Iniciar MediaMTX
+        # PASO 3: Abrir la cámara RealSense D435
         # ──────────────────────────────────────────────────────────────
-        print(f"\n[3/6] Preparando servidor RTSP (MediaMTX) ...")
-        proceso_mediamtx = iniciar_mediamtx(puerto)
-
-        # ──────────────────────────────────────────────────────────────
-        # PASO 4: Abrir la cámara RealSense D435
-        # ──────────────────────────────────────────────────────────────
-        print(f"\n[4/6] Abriendo cámara Intel RealSense (índice {indice_camara}) ...")
+        print(f"\n[3/5] Abriendo cámara Intel RealSense (índice {indice_camara}) ...")
 
         ctx = rs.context()
         dispositivos = ctx.query_devices()
@@ -859,15 +697,22 @@ def iniciar_emisor(indice_camara=0, puerto=PUERTO_RTSP_DEFECTO,
             print(f"  ✗ Error al iniciar la cámara: {e}")
             print("    • Verifica que esté en un puerto USB 3.0 (azul)")
             print("    • Cierra cualquier otro programa que use la cámara")
-            print("    • Si estás en WSL, necesitas usbipd-win (ver README)")
             sys.exit(1)
 
         print(f"  ✓ Pipeline iniciado (Color 1920×1080, Depth/IR 1280×720 @ 30fps)")
 
         # ──────────────────────────────────────────────────────────────
-        # PASO 5: Lanzar 4 FFmpeg → RTSP
+        # PASO 4: Lanzar 4 FFmpeg como servidores RTSP
         # ──────────────────────────────────────────────────────────────
-        print(f"\n[5/6] Iniciando transmisión de 4 canales RTSP ...")
+        print(f"\n[4/5] Iniciando 4 servidores RTSP (FFmpeg directo) ...")
+
+        # Verificar que los 4 puertos estén libres
+        for nombre, p in puertos.items():
+            if not verificar_puerto_disponible(p):
+                print(f"  ✗ Puerto {p} ({nombre}) ya está en uso.")
+                print(f"    Usa --puerto OTRO o mata el proceso que lo ocupa:")
+                print(f"    sudo lsof -i :{p}")
+                sys.exit(1)
 
         # Distribución proporcional del bitrate entre los 4 canales
         bitrates = {
@@ -885,29 +730,22 @@ def iniciar_emisor(indice_camara=0, puerto=PUERTO_RTSP_DEFECTO,
         }
 
         for nombre, cfg in canales.items():
-            url = f"rtsp://127.0.0.1:{puerto}/{nombre}"
-            print(f"  → {nombre:<6} {cfg['ancho']}×{cfg['alto']} @ {cfg['br']}kbps → {url}")
+            p = puertos[nombre]
+            print(f"  → {nombre:<6} {cfg['ancho']}×{cfg['alto']} @ {cfg['br']}kbps → puerto {p}")
             procesos_ff[nombre] = crear_ffmpeg(
-                ruta_ffmpeg, url,
+                ruta_ffmpeg, p,
                 cfg["ancho"], cfg["alto"], cfg["pix"], 30, cfg["br"]
             )
 
-        time.sleep(1)
-
-        # Verificar que todos los FFmpeg RTSP arrancaron correctamente
-        for nombre, proc in procesos_ff.items():
-            if proc.poll() is not None:
-                stderr = proc.stderr.read().decode(errors="replace")[:300]
-                print(f"  ✗ FFmpeg ({nombre}) falló al iniciar:")
-                print(f"    {stderr}")
-                sys.exit(1)
+        # Dar tiempo a FFmpeg para abrir los sockets de escucha
+        time.sleep(2)
 
         # ──────────────────────────────────────────────────────────────
-        # PASO 6: Grabación MKV (desactivada en emisor)
+        # PASO 5: Grabación (desactivada en emisor)
         # ──────────────────────────────────────────────────────────────
-        print(f"\n[6/6] Grabación local MKV en emisor: desactivada (se realiza en el receptor)")
+        print(f"\n[5/5] Grabación local MKV en emisor: desactivada (se realiza en el receptor)")
 
-        # ─── Paso 6.5: Iniciar grabación de rango de frames sin pérdidas ───
+        # ─── Paso 5.5: Iniciar grabación de rango de frames sin pérdidas ───
         grabador_rango = None
         if rango_grabacion is not None:
             try:
@@ -915,7 +753,7 @@ def iniciar_emisor(indice_camara=0, puerto=PUERTO_RTSP_DEFECTO,
                 if dir_salida is None:
                     dir_salida = f"rango_grabacion_{frame_inicio}_{frame_fin}"
                 dir_salida_abs = os.path.abspath(dir_salida)
-                print(f"\n[6.5] Preparando grabación de rango de frames sin pérdidas ...")
+                print(f"\n[5.5] Preparando grabación de rango de frames sin pérdidas ...")
                 print(f"  → Rango: {frame_inicio} a {frame_fin}")
                 print(f"  → Directorio de salida: {dir_salida_abs}")
                 grabador_rango = GrabadorRango(dir_salida_abs, frame_inicio, frame_fin)
@@ -930,17 +768,17 @@ def iniciar_emisor(indice_camara=0, puerto=PUERTO_RTSP_DEFECTO,
         print("\n" + "═" * 62)
         print("  ✓ TRANSMISIÓN ACTIVA — 4 Canales RTSP + LSB")
         print("─" * 62)
-        print(f"  Color (RGB):     rtsp://{ip_local}:{puerto}/color")
-        print(f"  Profundidad:     rtsp://{ip_local}:{puerto}/depth")
-        print(f"  Infrarrojo 1:    rtsp://{ip_local}:{puerto}/ir1")
-        print(f"  Infrarrojo 2:    rtsp://{ip_local}:{puerto}/ir2")
+        print(f"  Color (RGB):     rtsp://{ip_local}:{puertos['color']}/stream")
+        print(f"  Profundidad:     rtsp://{ip_local}:{puertos['depth']}/stream")
+        print(f"  Infrarrojo 1:    rtsp://{ip_local}:{puertos['ir1']}/stream")
+        print(f"  Infrarrojo 2:    rtsp://{ip_local}:{puertos['ir2']}/stream")
         print("─" * 62)
         print(f"  LSB:  128 bits × {BITS_POR_BLOQUE}px/bit = {PIXELES_LSB}px en fila 0")
         if grabador_rango is not None:
             print(f"  🔴 GRABANDO RANGO [{frame_inicio} - {frame_fin}] → {os.path.abspath(dir_salida)}")
         print("─" * 62)
         print(f"  Receptor:  python3 receptor_ubuntu.py {ip_local}")
-        print(f"  VLC:       vlc rtsp://{ip_local}:{puerto}/color")
+        print(f"  VLC:       vlc rtsp://{ip_local}:{puertos['color']}/stream")
         print("═" * 62)
         print("\n  Presiona Ctrl+C para detener.\n")
 
@@ -1086,16 +924,6 @@ def iniciar_emisor(indice_camara=0, puerto=PUERTO_RTSP_DEFECTO,
                     proc.kill()
                     print(f"  ✓ FFmpeg ({nombre}) forzado")
 
-        # ── Detener MediaMTX ────────────────────────────────────────────
-        if proceso_mediamtx and proceso_mediamtx.poll() is None:
-            try:
-                proceso_mediamtx.terminate()
-                proceso_mediamtx.wait(timeout=5)
-                print("  ✓ MediaMTX detenido")
-            except Exception:
-                proceso_mediamtx.kill()
-                print("  ✓ MediaMTX forzado")
-
         # ── Resumen final ───────────────────────────────────────────────
         total_frames = frame_id - 1  # Restar 1 porque frame_id se incrementó antes de salir
         if total_frames > 0:
@@ -1112,22 +940,28 @@ def iniciar_emisor(indice_camara=0, puerto=PUERTO_RTSP_DEFECTO,
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Emisor RTSP v3 para Intel RealSense D435 — Ubuntu/Linux nativo con LSB.",
+        description="Emisor RTSP v4 para Intel RealSense D435 — Ubuntu/Linux nativo con LSB (FFmpeg RTSP Server directo).",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Ejemplos:
-  python3 emisor_ubuntu.py                         # Cámara 0, puerto 8554
+  python3 emisor_ubuntu.py                         # Cámara 0, puerto base 8554
   python3 emisor_ubuntu.py --cam 1                 # Segunda cámara
-  python3 emisor_ubuntu.py --puerto 9554           # Puerto alternativo
+  python3 emisor_ubuntu.py --puerto 9554           # Puerto base alternativo
   python3 emisor_ubuntu.py --calidad 4000          # Mayor calidad
   python3 emisor_ubuntu.py --listar-camaras        # Ver cámaras conectadas
   python3 emisor_ubuntu.py --diagnostico           # Diagnóstico del sistema
   python3 emisor_ubuntu.py --grabar-rango 150 450   # Grabar rango sin pérdidas
+
+Puertos RTSP (base + offset):
+  Color:  base     (ej. 8554)
+  Depth:  base + 1 (ej. 8555)
+  IR1:    base + 2 (ej. 8556)
+  IR2:    base + 3 (ej. 8557)
         """
     )
 
     parser.add_argument("--puerto", type=int, default=PUERTO_RTSP_DEFECTO,
-                        help=f"Puerto RTSP (defecto: {PUERTO_RTSP_DEFECTO})")
+                        help=f"Puerto RTSP base (defecto: {PUERTO_RTSP_DEFECTO})")
     parser.add_argument("--cam", type=int, default=0,
                         help="Índice de la cámara RealSense (defecto: 0)")
     parser.add_argument("--calidad", type=int, default=2000,

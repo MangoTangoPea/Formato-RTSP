@@ -3,10 +3,6 @@
 .venvv/
 venv/
 
-# MediaMTX (servidor RTSP, descargado automáticamente)
-mediamtx/
-mediamtx_linux/
-
 # Cache de Python
 __pycache__/
 *.pyc

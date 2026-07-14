@@ -1,11 +1,17 @@
 #!/usr/bin/env python3
 """
-Receptor RTSP Multicanal — Ubuntu/Linux Nativo (v3).
+Receptor RTSP Multicanal — Ubuntu/Linux Nativo (v4).
 
 Rediseñado con extracción de esteganografía LSB para verificación de sincronía.
 Se conecta a 4 streams RTSP independientes del emisor RealSense D435
 (Color, Depth, IR1, IR2) y extrae los metadatos ocultos (Frame ID + Timestamp)
 para mostrar la sincronía real entre canales en el HUD.
+
+Cada canal usa un puerto RTSP dedicado (FFmpeg RTSP Server directo, sin MediaMTX):
+  rtsp://<IP>:8554/stream  — Color (RGB)
+  rtsp://<IP>:8555/stream  — Profundidad
+  rtsp://<IP>:8556/stream  — Infrarrojo 1
+  rtsp://<IP>:8557/stream  — Infrarrojo 2
 
 Controles de teclado:
   m  → Mosaico (4 vistas combinadas)
@@ -19,8 +25,7 @@ Controles de teclado:
 
 Uso:
     python3 receptor_ubuntu.py <IP_DEL_EMISOR>
-    python3 receptor_ubuntu.py <IP> <PUERTO>
-    python3 receptor_ubuntu.py rtsp://<IP>:<PUERTO>/color
+    python3 receptor_ubuntu.py <IP> <PUERTO_BASE>
     python3 receptor_ubuntu.py --sin-hud <IP>
 """
 
@@ -56,7 +61,7 @@ except ImportError:
 # ═══════════════════════════════════════════════════════════════════════════
 
 PUERTO_RTSP_DEFECTO = 8554
-NOMBRE_VENTANA = "Receptor RTSP — RealSense D435 (Ubuntu v3 · LSB)"
+NOMBRE_VENTANA = "Receptor RTSP — RealSense D435 (Ubuntu v4 · LSB)"
 
 MOSAICO_ANCHO = 1920
 MOSAICO_ALTO = 1440
@@ -478,18 +483,19 @@ def dibujar_barra_estado(canvas, modo, segundos, fps_total, texto_sync="",
 
 def iniciar_receptor(ip, puerto, mostrar_hud=True, ruta_grabacion=None):
     """
-    Receptor RTSP v3: se conecta a 4 streams independientes del emisor
-    RealSense, extrae metadatos LSB y muestra sincronía real en el HUD.
+    Receptor RTSP v4: se conecta a 4 streams independientes del emisor
+    RealSense (un puerto por canal), extrae metadatos LSB y muestra
+    sincronía real en el HUD.
     """
     urls = {
-        "color": f"rtsp://{ip}:{puerto}/color",
-        "depth": f"rtsp://{ip}:{puerto}/depth",
-        "ir1":   f"rtsp://{ip}:{puerto}/ir1",
-        "ir2":   f"rtsp://{ip}:{puerto}/ir2",
+        "color": f"rtsp://{ip}:{puerto}/stream",
+        "depth": f"rtsp://{ip}:{puerto + 1}/stream",
+        "ir1":   f"rtsp://{ip}:{puerto + 2}/stream",
+        "ir2":   f"rtsp://{ip}:{puerto + 3}/stream",
     }
 
     print("\n" + "═" * 62)
-    print("  RECEPTOR RTSP — RealSense D435 · Ubuntu Nativo (v3 · LSB)")
+    print("  RECEPTOR RTSP — RealSense D435 · Ubuntu Nativo (v4 · LSB)")
     print("═" * 62)
     for nombre, url in urls.items():
         print(f"  {nombre:<6} → {url}")
@@ -502,7 +508,7 @@ def iniciar_receptor(ip, puerto, mostrar_hud=True, ruta_grabacion=None):
     # Crear lectores
     lectores = {}
     for nombre, url in urls.items():
-        lectores[nombre] = LectorRTSP(url, name=nombre)
+        lectores[nombre] = LectorRTSP(url, nombre)
         lectores[nombre].iniciar()
 
     print("\n  Conectando a los flujos RTSP ...\n")
@@ -753,17 +759,22 @@ def iniciar_receptor(ip, puerto, mostrar_hud=True, ruta_grabacion=None):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Receptor RTSP v3 para Intel RealSense D435 — Ubuntu/Linux nativo con extracción LSB.",
+        description="Receptor RTSP v4 para Intel RealSense D435 — Ubuntu/Linux nativo con extracción LSB (FFmpeg RTSP Server directo).",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Ejemplos:
-  python3 receptor_ubuntu.py 192.168.1.42             # IP del emisor
-  python3 receptor_ubuntu.py 192.168.1.42 9554        # Puerto personalizado
-  python3 receptor_ubuntu.py rtsp://192.168.1.42:8554/color   # URL directa
+  python3 receptor_ubuntu.py 192.168.1.42             # IP del emisor (puerto base 8554)
+  python3 receptor_ubuntu.py 192.168.1.42 9554        # Puerto base personalizado
   python3 receptor_ubuntu.py --sin-hud 192.168.1.42   # Sin overlay de info
   python3 receptor_ubuntu.py --grabar 192.168.1.42    # Graba en grabacion.mkv
   python3 receptor_ubuntu.py --grabar video.mkv 192.168.1.42 # Graba en ruta específica
   python3 receptor_ubuntu.py 127.0.0.1                # Prueba local
+
+Puertos RTSP (base + offset):
+  Color:  base     (ej. 8554)
+  Depth:  base + 1 (ej. 8555)
+  IR1:    base + 2 (ej. 8556)
+  IR2:    base + 3 (ej. 8557)
 
 Controles en la ventana:
   M → Mosaico (4 vistas)    1 → Color    2 → IR1
@@ -776,9 +787,9 @@ HUD muestra: Frame ID real (LSB), Timestamp del emisor, Latencia,
     )
 
     parser.add_argument("destino", nargs="?", default=None,
-                        help="IP del emisor o URL RTSP completa")
+                        help="Dirección IP del emisor")
     parser.add_argument("puerto", nargs="?", type=int, default=PUERTO_RTSP_DEFECTO,
-                        help=f"Puerto RTSP (defecto: {PUERTO_RTSP_DEFECTO})")
+                        help=f"Puerto RTSP base (defecto: {PUERTO_RTSP_DEFECTO})")
     parser.add_argument("--sin-hud", action="store_true",
                         help="No mostrar información de estado sobre el vídeo")
     parser.add_argument("--grabar", nargs="?", const="grabacion.mkv", default=None,
@@ -792,24 +803,7 @@ HUD muestra: Frame ID real (LSB), Timestamp del emisor, Latencia,
     puerto = args.puerto
 
     if args.destino is not None:
-        if args.destino.startswith("rtsp://"):
-            sin_proto = args.destino[7:]
-            if "/" in sin_proto:
-                host_port = sin_proto.split("/")[0]
-            else:
-                host_port = sin_proto
-
-            if ":" in host_port:
-                partes = host_port.split(":")
-                ip = partes[0]
-                try:
-                    puerto = int(partes[1])
-                except ValueError:
-                    pass
-            else:
-                ip = host_port
-        else:
-            ip = args.destino
+        ip = args.destino
 
     if ip == "127.0.0.1" and args.destino is None:
         print("  ⚠ No se especificó IP del emisor, usando 127.0.0.1 (loopback)")
