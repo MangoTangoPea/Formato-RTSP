@@ -1,30 +1,17 @@
 #!/usr/bin/env python3
 """
-Emisor RTSP para Intel RealSense D435 — Windows (v3).
+Emisor RTSP para Intel RealSense D435 — Windows (v4).
 
 Rediseñado con esteganografía LSB y grabación de mosaico unificado:
   - Inyecta Frame ID (64 bits) + Timestamp (64 bits) en la fila 0 vía LSB.
-  - Soporta grabación local en Matroska (.mkv) como mosaico unificado (--grabar).
-  - Usa un único stdin pipe para FFmpeg (sin FIFOs o archivos temporales complejos).
-  - Oculta ventanas de consola de FFmpeg y MediaMTX en Windows.
+  - Soporta grabación local de rango sin pérdidas (--grabar-rango).
+  - Usa FFmpeg como servidor RTSP directo (sin MediaMTX).
 
-Publica 4 streams RTSP independientes:
-  rtsp://<IP>:8554/color    — RGB 1920x1080
-  rtsp://<IP>:8554/depth    — Profundidad con heatmap JET 1280x720
-  rtsp://<IP>:8554/ir1      — Infrarrojo izquierdo 1280x720
-  rtsp://<IP>:8554/ir2      — Infrarrojo derecho 1280x720
-
-Grabación MKV Mosaico:
-  Combina los 4 canales (ya con LSB inyectado) en un mosaico unificado
-  de 1920x1440 y lo codifica como un solo track H.264.
-  Layout del mosaico idéntico al receptor:
-    ┌──────────────────────────────┐
-    │           Color              │
-    │        1920 × 1080           │
-    ├──────────┬──────────┬────────┤
-    │   IR1    │  Depth   │  IR2   │
-    │ 640×360  │ 640×360  │ 640×360│
-    └──────────┴──────────┴────────┘
+Publica 4 streams RTSP independientes (un puerto por canal):
+  rtsp://<IP>:8554/stream   — RGB 1920x1080
+  rtsp://<IP>:8555/stream   — Profundidad con heatmap JET 1280x720
+  rtsp://<IP>:8556/stream   — Infrarrojo izquierdo 1280x720
+  rtsp://<IP>:8557/stream   — Infrarrojo derecho 1280x720
 """
 
 import subprocess
@@ -34,9 +21,7 @@ import signal
 import time
 import argparse
 import platform
-import zipfile
 import shutil
-import urllib.request
 import struct
 import queue
 import threading
@@ -85,14 +70,6 @@ except ImportError:
 # ═══════════════════════════════════════════════════════════════════════════
 
 PUERTO_RTSP_DEFECTO = 8554
-DIR_BASE = os.path.dirname(os.path.abspath(__file__))
-DIR_MEDIAMTX = os.path.join(DIR_BASE, "mediamtx")
-
-MEDIAMTX_VERSION = "v1.12.2"
-MEDIAMTX_URL = (
-    f"https://github.com/bluenviron/mediamtx/releases/download/"
-    f"{MEDIAMTX_VERSION}/mediamtx_{MEDIAMTX_VERSION}_windows_amd64.zip"
-)
 
 # Flags de creación de proceso para Windows (oculta ventanas emergentes de consola)
 _CREATION_FLAGS = subprocess.CREATE_NO_WINDOW if platform.system() == "Windows" else 0
@@ -246,77 +223,6 @@ def obtener_ruta_ffmpeg():
         return None
 
 
-def descargar_mediamtx():
-    """Descarga y extrae el servidor MediaMTX. Retorna la ruta al ejecutable."""
-    exe_path = os.path.join(DIR_MEDIAMTX, "mediamtx.exe")
-    if os.path.isfile(exe_path):
-        print(f"  ✓ MediaMTX ya existe en: {exe_path}")
-        return exe_path
-
-    print(f"  ↓ Descargando MediaMTX {MEDIAMTX_VERSION} ...")
-    print(f"    URL: {MEDIAMTX_URL}")
-
-    os.makedirs(DIR_MEDIAMTX, exist_ok=True)
-    zip_path = os.path.join(DIR_MEDIAMTX, "mediamtx.zip")
-    try:
-        urllib.request.urlretrieve(MEDIAMTX_URL, zip_path)
-    except Exception as e:
-        print(f"  ✗ Error al descargar MediaMTX: {e}")
-        sys.exit(1)
-
-    print("  ↓ Extrayendo MediaMTX ...")
-    try:
-        with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-            zip_ref.extractall(DIR_MEDIAMTX)
-    except zipfile.BadZipFile:
-        print("  ✗ El archivo descargado no es un ZIP válido.")
-        os.remove(zip_path)
-        sys.exit(1)
-
-    os.remove(zip_path)
-
-    if os.path.isfile(exe_path):
-        print(f"  ✓ MediaMTX instalado en: {exe_path}")
-        return exe_path
-    else:
-        print("  ✗ No se encontró mediamtx.exe después de la extracción.")
-        sys.exit(1)
-
-
-def iniciar_mediamtx(puerto):
-    """Inicia el servidor MediaMTX en el puerto indicado."""
-    exe_path = descargar_mediamtx()
-    entorno = os.environ.copy()
-    entorno["MTX_RTSPADDRESS"] = f":{puerto}"
-
-    print(f"  → Iniciar MediaMTX en el puerto {puerto} ...")
-    try:
-        proceso_mtx = subprocess.Popen(
-            [exe_path],
-            cwd=DIR_MEDIAMTX,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            env=entorno,
-            creationflags=_CREATION_FLAGS
-        )
-    except PermissionError:
-        print("  ✗ Sin permisos para ejecutar MediaMTX. Ejecuta como administrador.")
-        sys.exit(1)
-    except Exception as e:
-        print(f"  ✗ Error al iniciar MediaMTX: {e}")
-        sys.exit(1)
-
-    time.sleep(2)
-    if proceso_mtx.poll() is not None:
-        salida = proceso_mtx.stdout.read().decode(errors='replace')
-        print(f"  ✗ MediaMTX terminó inesperadamente. Salida:")
-        print(f"    {salida[:500]}")
-        sys.exit(1)
-
-    print(f"  ✓ MediaMTX iniciado (PID: {proceso_mtx.pid})")
-    return proceso_mtx
-
-
 def listar_camaras_realsense():
     """Lista todos los dispositivos Intel RealSense conectados."""
     contexto = rs.context()
@@ -373,12 +279,31 @@ def obtener_ip_local():
         return "127.0.0.1"
 
 
+def verificar_puerto_disponible(puerto):
+    """Verifica si un puerto TCP está disponible."""
+    import socket
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(1)
+        result = s.connect_ex(("127.0.0.1", puerto))
+        s.close()
+        return result != 0  # True si está libre
+    except Exception:
+        return True
+
+
 # ═══════════════════════════════════════════════════════════════════════════
-# PROCESOS FFMPEG
+# PROCESOS FFMPEG — RTSP SERVER DIRECTO
 # ═══════════════════════════════════════════════════════════════════════════
 
-def crear_proceso_ffmpeg(ruta_ffmpeg, url_stream, ancho, alto, pix_fmt, fps, bitrate_kbps):
-    """Lanza FFmpeg para codificar rawvideo → H.264 → RTSP."""
+def crear_proceso_ffmpeg(ruta_ffmpeg, puerto_listen, ancho, alto, pix_fmt, fps, bitrate_kbps):
+    """
+    Lanza FFmpeg como servidor RTSP directo (sin MediaMTX).
+
+    FFmpeg abre un socket TCP en el puerto indicado y espera conexiones
+    RTSP entrantes. El receptor se conecta directamente a este puerto.
+    """
+    url_listen = f"rtsp://0.0.0.0:{puerto_listen}/stream"
     comando = [
         ruta_ffmpeg,
         "-y",
@@ -397,7 +322,8 @@ def crear_proceso_ffmpeg(ruta_ffmpeg, url_stream, ancho, alto, pix_fmt, fps, bit
         "-g", str(fps * 2),
         "-f", "rtsp",
         "-rtsp_transport", "tcp",
-        url_stream
+        "-rtsp_flags", "listen",
+        url_listen
     ]
     return subprocess.Popen(
         comando,
@@ -416,9 +342,9 @@ def iniciar_emisor(indice_camara=0, puerto=PUERTO_RTSP_DEFECTO,
                    bitrate_kbps=2000,
                    rango_grabacion=None, dir_salida=None):
     """
-    Emisor RTSP v3 con esteganografía LSB para Windows.
+    Emisor RTSP v4 con esteganografía LSB para Windows.
+    Usa FFmpeg como servidor RTSP directo (sin MediaMTX).
     """
-    proceso_mediamtx = None
     proceso_color = None
     proceso_depth = None
     proceso_ir1 = None
@@ -426,23 +352,34 @@ def iniciar_emisor(indice_camara=0, puerto=PUERTO_RTSP_DEFECTO,
     pipeline = None
     pipeline_started = False
 
+    # Puertos: base para color, base+1 depth, base+2 ir1, base+3 ir2
+    puerto_color = puerto
+    puerto_depth = puerto + 1
+    puerto_ir1 = puerto + 2
+    puerto_ir2 = puerto + 3
+
     try:
         print("\n" + "═" * 62)
-        print("  EMISOR RTSP RealSense — Windows (v3)")
-        print("  Esteganografía LSB activa · Bloques de 8px por bit")
+        print("  EMISOR RTSP RealSense — Windows (v4)")
+        print("  Esteganografía LSB activa · FFmpeg RTSP Server directo")
         print("═" * 62)
 
-        print("\n[1/5] Verificando FFmpeg (vía imageio-ffmpeg) ...")
+        print("\n[1/4] Verificando FFmpeg (vía imageio-ffmpeg) ...")
         ruta_ffmpeg = obtener_ruta_ffmpeg()
         if ruta_ffmpeg is None:
             print("  ✗ No se pudo obtener el binario de FFmpeg.")
             sys.exit(1)
         print(f"  ✓ FFmpeg encontrado: {ruta_ffmpeg}")
 
-        print(f"\n[2/5] Preparando servidor RTSP (MediaMTX) ...")
-        proceso_mediamtx = iniciar_mediamtx(puerto)
+        # Verificar que los 4 puertos estén disponibles
+        for p, nombre in [(puerto_color, "color"), (puerto_depth, "depth"),
+                          (puerto_ir1, "ir1"), (puerto_ir2, "ir2")]:
+            if not verificar_puerto_disponible(p):
+                print(f"  ✗ Puerto {p} ({nombre}) ya está en uso.")
+                print(f"    Usa --puerto OTRO_PUERTO o cierra el proceso que lo ocupa.")
+                sys.exit(1)
 
-        print(f"\n[3/5] Abriendo dispositivo Intel RealSense (índice {indice_camara}) ...")
+        print(f"\n[2/4] Abriendo dispositivo Intel RealSense (índice {indice_camara}) ...")
         serial_cam = obtener_serial_por_indice(indice_camara)
 
         pipeline = rs.pipeline()
@@ -466,34 +403,29 @@ def iniciar_emisor(indice_camara=0, puerto=PUERTO_RTSP_DEFECTO,
 
         fps_stream = 30
 
-        print(f"\n[4/5] Iniciando transmisión RTSP de 4 canales ...")
+        print(f"\n[3/4] Iniciando 4 servidores RTSP (FFmpeg directo) ...")
         bitrate_color = max(100, int(bitrate_kbps * 0.6))
         bitrate_depth = max(100, int(bitrate_kbps * 0.2))
         bitrate_ir1 = max(100, int(bitrate_kbps * 0.1))
         bitrate_ir2 = max(100, int(bitrate_kbps * 0.1))
 
-        url_color = f"rtsp://127.0.0.1:{puerto}/color"
-        url_depth = f"rtsp://127.0.0.1:{puerto}/depth"
-        url_ir1 = f"rtsp://127.0.0.1:{puerto}/ir1"
-        url_ir2 = f"rtsp://127.0.0.1:{puerto}/ir2"
+        print(f"  → color  1920×1080 @ {bitrate_color}kbps → puerto {puerto_color}")
+        proceso_color = crear_proceso_ffmpeg(ruta_ffmpeg, puerto_color, 1920, 1080, "bgr24", fps_stream, bitrate_color)
 
-        proceso_color = crear_proceso_ffmpeg(ruta_ffmpeg, url_color, 1920, 1080, "bgr24", fps_stream, bitrate_color)
-        proceso_depth = crear_proceso_ffmpeg(ruta_ffmpeg, url_depth, 1280, 720, "bgr24", fps_stream, bitrate_depth)
-        proceso_ir1 = crear_proceso_ffmpeg(ruta_ffmpeg, url_ir1, 1280, 720, "gray", fps_stream, bitrate_ir1)
-        proceso_ir2 = crear_proceso_ffmpeg(ruta_ffmpeg, url_ir2, 1280, 720, "gray", fps_stream, bitrate_ir2)
+        print(f"  → depth  1280×720  @ {bitrate_depth}kbps → puerto {puerto_depth}")
+        proceso_depth = crear_proceso_ffmpeg(ruta_ffmpeg, puerto_depth, 1280, 720, "bgr24", fps_stream, bitrate_depth)
 
-        time.sleep(1)
+        print(f"  → ir1    1280×720  @ {bitrate_ir1}kbps → puerto {puerto_ir1}")
+        proceso_ir1 = crear_proceso_ffmpeg(ruta_ffmpeg, puerto_ir1, 1280, 720, "gray", fps_stream, bitrate_ir1)
 
-        for proc, name in [(proceso_color, "color"), (proceso_depth, "depth"),
-                           (proceso_ir1, "ir1"), (proceso_ir2, "ir2")]:
-            if proc.poll() is not None:
-                stderr_out = proc.stderr.read().decode(errors='replace')
-                print(f"  ✗ FFmpeg ({name}) terminó inesperadamente:")
-                print(f"    {stderr_out[:300]}")
-                sys.exit(1)
+        print(f"  → ir2    1280×720  @ {bitrate_ir2}kbps → puerto {puerto_ir2}")
+        proceso_ir2 = crear_proceso_ffmpeg(ruta_ffmpeg, puerto_ir2, 1280, 720, "gray", fps_stream, bitrate_ir2)
+
+        # Dar tiempo a FFmpeg para abrir los sockets de escucha
+        time.sleep(2)
 
         # Grabación local MKV en emisor desactivada
-        print(f"\n[5/5] Grabación local MKV en emisor: desactivada (se realiza en el receptor)")
+        print(f"\n[4/4] Grabación local MKV en emisor: desactivada (se realiza en el receptor)")
 
         grabador_rango = None
         if rango_grabacion is not None:
@@ -502,7 +434,7 @@ def iniciar_emisor(indice_camara=0, puerto=PUERTO_RTSP_DEFECTO,
                 if dir_salida is None:
                     dir_salida = f"rango_grabacion_{frame_inicio}_{frame_fin}"
                 dir_salida_abs = os.path.abspath(dir_salida)
-                print(f"\n[5.5] Preparando grabación de rango sin pérdidas ...")
+                print(f"\n[4.5] Preparando grabación de rango sin pérdidas ...")
                 grabador_rango = GrabadorRango(dir_salida_abs, frame_inicio, frame_fin)
             except Exception as e:
                 print(f"  ⚠ No se pudo iniciar el grabador de rango: {e}")
@@ -511,10 +443,10 @@ def iniciar_emisor(indice_camara=0, puerto=PUERTO_RTSP_DEFECTO,
         print("\n" + "═" * 62)
         print("  ✓ TRANSMISIÓN ACTIVA — 4 Canales RTSP + LSB")
         print("─" * 62)
-        print(f"  Color (RGB):   rtsp://{ip_local}:{puerto}/color")
-        print(f"  Depth Map:     rtsp://{ip_local}:{puerto}/depth")
-        print(f"  Infrared 1:    rtsp://{ip_local}:{puerto}/ir1")
-        print(f"  Infrared 2:    rtsp://{ip_local}:{puerto}/ir2")
+        print(f"  Color (RGB):   rtsp://{ip_local}:{puerto_color}/stream")
+        print(f"  Depth Map:     rtsp://{ip_local}:{puerto_depth}/stream")
+        print(f"  Infrared 1:    rtsp://{ip_local}:{puerto_ir1}/stream")
+        print(f"  Infrared 2:    rtsp://{ip_local}:{puerto_ir2}/stream")
         print("─" * 62)
         print(f"  LSB:  128 bits × {BITS_POR_BLOQUE}px/bit = {PIXELES_LSB}px en fila 0")
         if grabador_rango is not None:
@@ -643,15 +575,6 @@ def iniciar_emisor(indice_camara=0, puerto=PUERTO_RTSP_DEFECTO,
                     proc.kill()
                     print(f"  ✓ FFmpeg ({name}) forzado")
 
-        # Detener MediaMTX
-        if proceso_mediamtx and proceso_mediamtx.poll() is None:
-            try:
-                proceso_mediamtx.terminate()
-                proceso_mediamtx.wait(timeout=5)
-                print("  ✓ MediaMTX detenido")
-            except Exception:
-                proceso_mediamtx.kill()
-
         total_frames = frame_id - 1
         if total_frames > 0:
             dt_total = time.time() - tiempo_inicio
@@ -667,21 +590,27 @@ def iniciar_emisor(indice_camara=0, puerto=PUERTO_RTSP_DEFECTO,
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Emisor RTSP v3 con LSB para Windows.",
+        description="Emisor RTSP v4 con LSB para Windows (FFmpeg RTSP Server directo).",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Ejemplos de uso:
-  python emisor.py                          # Cámara 0, puerto 8554
+  python emisor.py                          # Cámara 0, puerto base 8554
   python emisor.py --cam 1                  # Usar segunda cámara RealSense
-  python emisor.py --puerto 9554            # Usar puerto alternativo
+  python emisor.py --puerto 9554            # Usar puerto base alternativo
   python emisor.py --calidad 4000           # Mayor calidad de vídeo
   python emisor.py --listar-camaras         # Ver cámaras RealSense detectadas
   python emisor.py --grabar-rango 150 450   # Grabar frames 150 a 450 sin pérdidas
+
+Puertos RTSP (base + offset):
+  Color:  base     (ej. 8554)
+  Depth:  base + 1 (ej. 8555)
+  IR1:    base + 2 (ej. 8556)
+  IR2:    base + 3 (ej. 8557)
         """
     )
 
     parser.add_argument("--puerto", type=int, default=PUERTO_RTSP_DEFECTO,
-                        help=f"Puerto TCP del servidor RTSP (por defecto: {PUERTO_RTSP_DEFECTO})")
+                        help=f"Puerto RTSP base (defecto: {PUERTO_RTSP_DEFECTO})")
     parser.add_argument("--cam", type=int, default=0,
                         help="Índice de la cámara RealSense a usar (por defecto: 0)")
     parser.add_argument("--calidad", type=int, default=2000,

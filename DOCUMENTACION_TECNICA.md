@@ -1,6 +1,6 @@
 # DOCUMENTACIÓN TÉCNICA: ESTEGANOGRAFÍA LSB Y GRABACIÓN CRÍTICA EN MOSAICO
 
-Este documento detalla la arquitectura de software, fundamentos matemáticos y configuraciones de red de la versión 3 de la suite RTSP para Intel RealSense D435.
+Este documento detalla la arquitectura de software, fundamentos matemáticos y configuraciones de red de la versión 4 de la suite RTSP para Intel RealSense D435.
 
 ---
 
@@ -67,7 +67,7 @@ Al utilizar un **mosaico de una sola vista físico de 1920×1440**:
 
 ## 3. Pipeline de Escritura y FFmpeg en Tiempo Real
 
-El pipeline de transmisión y grabación se ha diseñado para evitar escrituras temporales en disco y llamadas a Named Pipes bloqueantes, unificando la arquitectura mediante el paso directo de descriptores de tuberías (`stdin` de procesos hijo en Python). La grabación del mosaico unificado ocurre en el receptor tras recibir los flujos de red:
+El pipeline de transmisión y grabación se ha diseñado para evitar escrituras temporales en disco y llamadas a Named Pipes bloqueantes, unificando la arquitectura mediante el paso directo de descriptores de tuberías (`stdin` de procesos hijo en Python). Cada proceso FFmpeg actúa como servidor RTSP directo usando `-rtsp_flags listen`. La grabación del mosaico unificado ocurre en el receptor tras recibir los flujos de red:
 
 ```
    ┌────────────────────────────────────────────────────────┐
@@ -78,14 +78,11 @@ El pipeline de transmisión y grabación se ha diseñado para evitar escrituras 
                               │
                               ▼
                  ┌───────────────────────────┐
-                 │ 4 FFmpeg codificando H.264│
+                 │ 4 FFmpeg (RTSP Server     │
+                 │  directo, -rtsp_flags     │
+                 │  listen)                  │
                  └────────────┬──────────────┘
-                              │ (Publicación RTSP)
-                              ▼
-                 ┌───────────────────────────┐
-                 │ MediaMTX (RTSP Broker)    │
-                 └────────────┬──────────────┘
-                              │ (Transmisión de Red)
+                              │ (Transmisión RTSP directa)
                               ▼
                        ┌──────────────┐
                        │ Receptor OSD │

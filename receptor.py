@@ -1,11 +1,17 @@
 #!/usr/bin/env python3
 """
-Receptor RTSP Multicanal — Windows (v3).
+Receptor RTSP Multicanal — Windows (v4).
 
 Rediseñado con extracción de esteganografía LSB para verificación de sincronía.
 Se conecta a 4 flujos RTSP independientes de la cámara Intel RealSense D435
 (Color, IR1, IR2, Depth) y extrae los metadatos ocultos (Frame ID + Timestamp)
 para mostrar la sincronía real entre canales en el HUD.
+
+Cada canal usa un puerto RTSP dedicado (FFmpeg RTSP Server directo, sin MediaMTX):
+  rtsp://<IP>:8554/stream  — Color (RGB)
+  rtsp://<IP>:8555/stream  — Profundidad
+  rtsp://<IP>:8556/stream  — Infrarrojo 1
+  rtsp://<IP>:8557/stream  — Infrarrojo 2
 
 Teclas de control en la ventana:
   m/M → Modo Mosaico (RGB superior, IR1/Depth/IR2 inferiores)
@@ -19,8 +25,7 @@ Teclas de control en la ventana:
 
 Uso:
     python receptor.py <IP_DEL_EMISOR>
-    python receptor.py <IP> <PUERTO>
-    python receptor.py rtsp://<IP>:<PUERTO>/color
+    python receptor.py <IP> <PUERTO_BASE>
     python receptor.py --sin-hud <IP>
 """
 
@@ -32,6 +37,7 @@ import threading
 import struct
 import datetime
 import subprocess
+import shutil
 
 # ─── Configurar la codificación de la consola para Unicode en Windows ─────
 if sys.platform.startswith("win"):
@@ -50,10 +56,7 @@ except ImportError:
     print("  Instálalo con:  pip install -r requirements.txt")
     sys.exit(1)
 
-try:
-    import imageio_ffmpeg
-except ImportError:
-    imageio_ffmpeg = None
+
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -61,7 +64,7 @@ except ImportError:
 # ═══════════════════════════════════════════════════════════════════════════
 
 PUERTO_RTSP_DEFECTO = 8554
-NOMBRE_VENTANA = "Receptor RTSP — RealSense D435 (v3 · LSB)"
+NOMBRE_VENTANA = "Receptor RTSP — RealSense D435 (v4 · LSB)"
 
 MOSAICO_ANCHO = 1920
 MOSAICO_ALTO = 1440
@@ -74,10 +77,25 @@ _CREATION_FLAGS = subprocess.CREATE_NO_WINDOW if sys.platform.startswith("win") 
 # ═══════════════════════════════════════════════════════════════════════════
 
 def obtener_ruta_ffmpeg():
-    """Obtiene la ruta al ejecutable de FFmpeg usando imageio-ffmpeg."""
-    if imageio_ffmpeg is None:
-        return None
+    """Obtiene la ruta al ejecutable de FFmpeg. Busca en el sistema y como fallback usa imageio-ffmpeg."""
+    # Opción 1: FFmpeg del sistema
+    ruta_sistema = shutil.which("ffmpeg")
+    if ruta_sistema:
+        try:
+            resultado = subprocess.run(
+                [ruta_sistema, "-version"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                creationflags=_CREATION_FLAGS
+            )
+            if resultado.returncode == 0:
+                return ruta_sistema
+        except Exception:
+            pass
+
+    # Opción 2: Fallback a imageio-ffmpeg
     try:
+        import imageio_ffmpeg
         ruta = imageio_ffmpeg.get_ffmpeg_exe()
         resultado = subprocess.run(
             [ruta, "-version"],
@@ -87,9 +105,10 @@ def obtener_ruta_ffmpeg():
         )
         if resultado.returncode == 0:
             return ruta
-        return None
     except Exception:
-        return None
+        pass
+
+    return None
 
 
 def construir_mosaico(color_img, depth_color, ir1_img, ir2_img, cv2_mod):
@@ -454,17 +473,17 @@ def letterbox(frame, ancho_ventana, alto_ventana):
 
 def iniciar_receptor(url_base_ip, puerto, mostrar_hud_info=True, ruta_grabacion=None):
     """
-    Receptor RTSP v3 con extracción LSB para Windows.
-    Se conecta a 4 streams independientes, extrae metadatos LSB ocultos
-    y muestra sincronía real en el HUD.
+    Receptor RTSP v4 con extracción LSB para Windows.
+    Se conecta a 4 streams independientes (un puerto por canal),
+    extrae metadatos LSB ocultos y muestra sincronía real en el HUD.
     """
-    url_color = f"rtsp://{url_base_ip}:{puerto}/color"
-    url_depth = f"rtsp://{url_base_ip}:{puerto}/depth"
-    url_ir1 = f"rtsp://{url_base_ip}:{puerto}/ir1"
-    url_ir2 = f"rtsp://{url_base_ip}:{puerto}/ir2"
+    url_color = f"rtsp://{url_base_ip}:{puerto}/stream"
+    url_depth = f"rtsp://{url_base_ip}:{puerto + 1}/stream"
+    url_ir1 = f"rtsp://{url_base_ip}:{puerto + 2}/stream"
+    url_ir2 = f"rtsp://{url_base_ip}:{puerto + 3}/stream"
 
     print("\n" + "═" * 62)
-    print("  RECEPTOR RTSP MULTICANAL — RealSense D435 (v3 · LSB)")
+    print("  RECEPTOR RTSP MULTICANAL — RealSense D435 (v4 · LSB)")
     print("═" * 62)
     print(f"  Color (RGB):   {url_color}")
     print(f"  Depth Map:     {url_depth}")
@@ -508,14 +527,11 @@ def iniciar_receptor(url_base_ip, puerto, mostrar_hud_info=True, ruta_grabacion=
     if ruta_grabacion:
         print(f"\n  [Grabación] Grabación local MKV programada ...")
         print(f"    → Destino: {os.path.abspath(ruta_grabacion)}")
-        if imageio_ffmpeg is None:
-            print("    ⚠ Error: imageio-ffmpeg no está instalado. No se podrá grabar.")
+        ruta_ffmpeg = obtener_ruta_ffmpeg()
+        if ruta_ffmpeg is None:
+            print("    ⚠ Error: no se encontró un ejecutable de FFmpeg válido.")
         else:
-            ruta_ffmpeg = obtener_ruta_ffmpeg()
-            if ruta_ffmpeg is None:
-                print("    ⚠ Error: no se encontró un ejecutable de FFmpeg válido.")
-            else:
-                grabacion_pendiente = True
+            grabacion_pendiente = True
 
     try:
         while True:
@@ -790,16 +806,21 @@ def iniciar_receptor(url_base_ip, puerto, mostrar_hud_info=True, ruta_grabacion=
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Receptor RTSP v3 con extracción LSB para RealSense D435 — Windows.",
+        description="Receptor RTSP v4 con extracción LSB para RealSense D435 — Windows (FFmpeg RTSP Server directo).",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Ejemplos de uso:
-  python receptor.py 192.168.1.42                         # IP del emisor
-  python receptor.py 192.168.1.42 8554                    # IP y puerto
-  python receptor.py rtsp://192.168.1.42:8554/color       # URL directa
+  python receptor.py 192.168.1.42                         # IP del emisor (puerto base 8554)
+  python receptor.py 192.168.1.42 8554                    # IP y puerto base
   python receptor.py --sin-hud 192.168.1.42               # Sin overlay
   python receptor.py --grabar 192.168.1.42                # Graba en grabacion.mkv
   python receptor.py --grabar video.mkv 192.168.1.42      # Graba en ruta específica
+
+Puertos RTSP (base + offset):
+  Color:  base     (ej. 8554)
+  Depth:  base + 1 (ej. 8555)
+  IR1:    base + 2 (ej. 8556)
+  IR2:    base + 3 (ej. 8557)
 
 Controles en la ventana:
   M → Mosaico    1 → Color   2 → IR1    3 → Depth   4 → IR2
@@ -811,9 +832,9 @@ HUD muestra: Frame ID real (LSB), Timestamp del emisor, Latencia,
     )
 
     parser.add_argument("destino", nargs="?", default=None,
-                        help="URL RTSP completa o dirección IP del emisor")
+                        help="Dirección IP del emisor")
     parser.add_argument("puerto", nargs="?", type=int, default=PUERTO_RTSP_DEFECTO,
-                        help=f"Puerto del servidor RTSP (por defecto: {PUERTO_RTSP_DEFECTO})")
+                        help=f"Puerto RTSP base (por defecto: {PUERTO_RTSP_DEFECTO})")
     parser.add_argument("--sin-hud", action="store_true",
                         help="No mostrar información de estado (HUD) sobre el vídeo")
     parser.add_argument("--grabar", nargs="?", const="grabacion.mkv", default=None,
@@ -826,23 +847,6 @@ HUD muestra: Frame ID real (LSB), Timestamp del emisor, Latencia,
     puerto_destino = args.puerto
 
     if args.destino is not None:
-        if args.destino.startswith("rtsp://"):
-            sin_protocolo = args.destino[7:]
-            if "/" in sin_protocolo:
-                host_puerto = sin_protocolo.split("/")[0]
-            else:
-                host_puerto = sin_protocolo
-
-            if ":" in host_puerto:
-                parts = host_puerto.split(":")
-                ip_destino = parts[0]
-                try:
-                    puerto_destino = int(parts[1])
-                except ValueError:
-                    pass
-            else:
-                ip_destino = host_puerto
-        else:
-            ip_destino = args.destino
+        ip_destino = args.destino
 
     iniciar_receptor(ip_destino, puerto_destino, mostrar_hud_info=not args.sin_hud, ruta_grabacion=args.grabar)
