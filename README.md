@@ -6,7 +6,7 @@ El emisor captura 4 streams simultáneos (RGB, Infrarrojos y Profundidad) de una
 
 *Para detalles matemáticos, análisis de resiliencia del contenedor Matroska ante fallos de energía y especificación de ingeniería del pipeline, consulte la [Guía Técnica de Esteganografía y Grabación](DOCUMENTACION_TECNICA.md).*
 
-## Arquitectura del sistema
+## Arquitectura del sistema (Ubuntu/Jetson)
 
 ```
    ┌────────────────────────────────────────────────────────┐
@@ -16,18 +16,22 @@ El emisor captura 4 streams simultáneos (RGB, Infrarrojos y Profundidad) de una
                [ Inyección LSB en 4 canales ]
                               │
                               ▼
-                 ┌───────────────────────────┐
-                 │ 4 FFmpeg (RTSP Server     │
-                 │  directo, -rtsp_flags     │
-                 │  listen)                  │
-                 └────────────┬──────────────┘
-                              │ rtsp://<IP>:8554-8557/stream (Red Local)
-                              ▼
-                       ┌──────────────┐
-                       │ Receptor OSD │
-                       │   (OpenCV)   │
-                       └──────┬───────┘
-                              │
+                  ┌───────────────────────────┐
+                  │ 4 FFmpeg (Codificadores)  │
+                  │   con salida RTSP push    │
+                  └────────────┬──────────────┘
+                               │ push local a 127.0.0.1:8554
+                               ▼
+                       ┌───────────────┐
+                       │   MediaMTX    │ (Servidor RTSP centralizado)
+                       └───────┬───────┘
+                               │ rtsp://<IP>:8554/{color,depth,ir1,ir2}
+                               ▼
+                        ┌──────────────┐
+                        │ Receptor OSD │
+                        │   (OpenCV)   │
+                        └──────┬───────┘
+                               │
                [ Reconstrucción Mosaico en Receptor ]
                               ├──────────────────────────────┐
                               ▼                              ▼
@@ -48,32 +52,35 @@ El emisor captura 4 streams simultáneos (RGB, Infrarrojos y Profundidad) de una
 
 | Protocolo | Función | Transporte | Puerto por defecto |
 |-----------|---------|------------|-------------------|
-| RTSP      | Señalización (DESCRIBE, SETUP, PLAY, TEARDOWN) | TCP | 554 / 8554 |
+| RTSP      | Señalización (DESCRIBE, SETUP, PLAY, TEARDOWN) | TCP | 8554 |
 | RTP       | Transporte de paquetes de vídeo H.264 | UDP o TCP entrelazado | Negociado en SETUP |
 | RTCP      | Control de calidad (informes de recepción) | UDP | RTP + 1 |
 
-### Componentes
+### Componentes (Ubuntu)
 
 | Componente | Rol | Descripción |
 |------------|-----|-------------|
-| **`emisor.py` / `emisor_ubuntu.py`** | Publicador RTSP | Captura flujos nativos, inyecta LSB y los transmite vía RTSP de manera independiente. Cada canal se sirve con FFmpeg como servidor RTSP directo. También soporta la grabación local de rango sin pérdidas. |
-| **`receptor.py` / `receptor_ubuntu.py`** | Cliente RTSP y Grabador | Conecta a los 4 canales, extrae la esteganografía LSB con votación de mayoría, muestra la visualización interactiva y graba localmente en un archivo MKV unificado en mosaico 1920×1440. |
-| **FFmpeg** | Codificador y Servidor RTSP | Codifica en tiempo real los frames crudos en H.264 de ultra baja latencia. Actúa simultáneamente como servidor RTSP usando `-rtsp_flags listen`, eliminando la necesidad de intermediarios externos. |
+| **`emisor_ubuntu.py`** / **`emisor_jetson.py`** | Publicador RTSP | Captura flujos nativos, inyecta LSB y los transmite vía RTSP a MediaMTX. También soporta la grabación local de rango sin pérdidas. |
+| **`receptor_ubuntu.py`** / **`receptor_jetson.py`** | Cliente RTSP y Grabador | Conecta a los 4 canales de MediaMTX, extrae la esteganografía LSB con votación de mayoría, muestra la visualización interactiva y graba localmente en un archivo MKV unificado en mosaico 1920×1440. |
+| **MediaMTX** | Servidor RTSP central | Recibe las publicaciones (push) de los codificadores FFmpeg del emisor y permite múltiples conexiones de receptores en simultáneo sin interrumpir el flujo. |
+| **FFmpeg** | Codificador de vídeo | Codifica en tiempo real los frames crudos en H.264 de ultra baja latencia y los publica directamente en MediaMTX. |
 
-### ¿Cómo funciona el servidor RTSP integrado?
+### Servidor RTSP centralizado (MediaMTX)
 
-FFmpeg puede actuar como **servidor RTSP directo** gracias a la opción `-rtsp_flags listen`. En este proyecto:
+El sistema en Linux/Ubuntu utiliza **MediaMTX** como servidor RTSP independiente e integrado:
 
-1. **Un proceso FFmpeg por canal**: El emisor lanza 4 procesos FFmpeg independientes, cada uno escuchando en su propio puerto TCP (8554, 8555, 8556, 8557).
-2. **Sin intermediarios**: No se necesita ningún software externo (como MediaMTX o rtsp-simple-server). FFmpeg recibe bytes crudos por `stdin`, los codifica en H.264 y los sirve directamente como streams RTSP.
-3. **Conexión directa**: El receptor se conecta directamente al puerto de cada FFmpeg. El esquema de puertos es:
+1. **Gestión Automática**: El emisor detecta la arquitectura del sistema (`x86_64` o `aarch64`), descarga automáticamente el binario oficial de MediaMTX y lo ejecuta en segundo plano.
+2. **Publicación FFmpeg (Push)**: El emisor arranca 4 instancias de FFmpeg que codifican los frames y los publican usando streaming RTSP normal en `rtsp://127.0.0.1:8554/<canal>`.
+3. **Robustez ante Reconexión**: Dado que MediaMTX es un servidor persistente, el emisor puede seguir transmitiendo sin importar si el receptor está conectado o no, evitando errores de tipo `Broken Pipe`.
 
-| Canal | Puerto | URL |
-|-------|--------|-----|
-| Color (RGB) | base (8554) | `rtsp://<IP>:8554/stream` |
-| Profundidad | base+1 (8555) | `rtsp://<IP>:8555/stream` |
-| Infrarrojo 1 | base+2 (8556) | `rtsp://<IP>:8556/stream` |
-| Infrarrojo 2 | base+3 (8557) | `rtsp://<IP>:8557/stream` |
+Esquema de URLs:
+
+| Canal | URL RTSP |
+|-------|----------|
+| Color (RGB) | `rtsp://<IP>:8554/color` |
+| Profundidad | `rtsp://<IP>:8554/depth` |
+| Infrarrojo 1 | `rtsp://<IP>:8554/ir1` |
+| Infrarrojo 2 | `rtsp://<IP>:8554/ir2` |
 
 ---
 
@@ -434,43 +441,47 @@ Deberías ver:
 
 ```
 ══════════════════════════════════════════════════════════════
-  EMISOR RTSP — Intel RealSense D435 · Ubuntu Nativo (v4)
-  Esteganografía LSB activa · FFmpeg RTSP Server directo
+  EMISOR RTSP — Intel RealSense D435 · Ubuntu (v6)
+  LSB: 8 px/bit · 1024 px totales · MediaMTX + FFmpeg push
 ══════════════════════════════════════════════════════════════
 
-[1/5] Buscando FFmpeg ...
-  ✓ FFmpeg: /usr/bin/ffmpeg
-    Origen: sistema (ffmpeg version 6.1.1-3ubuntu5)
+[1/6] Buscando FFmpeg ...
+  ✓ FFmpeg: /usr/bin/ffmpeg  (sistema (ffmpeg version 4.4.2-1ubuntu0.1 ...))
 
-[2/5] Verificando dependencias Python ...
-  ✓ OpenCV 4.x.x
-  ✓ NumPy 1.x.x
+[2/6] Verificando dependencias Python ...
+  ✓ OpenCV 5.0.0
+  ✓ NumPy 2.2.6
   ✓ pyrealsense2 disponible
   ✓ Reglas udev: /etc/udev/rules.d/99-realsense-libusb.rules
 
-[3/5] Abriendo cámara Intel RealSense (índice 0) ...
-  → Dispositivo: Intel RealSense D435 (S/N: 123456789)
+[3/6] Preparando servidor RTSP (MediaMTX) ...
+  ✓ MediaMTX corriendo (PID 12345)
+
+[4/6] Abriendo cámara Intel RealSense (índice 0) ...
+  → Reseteando dispositivo para limpiar sesiones anteriores ...
+  ✓ Dispositivo listo: Intel RealSense D435  S/N: 244222074950  USB: 3.2
   ✓ Pipeline iniciado (Color 1920×1080, Depth/IR 1280×720 @ 30fps)
 
-[4/5] Iniciando 4 servidores RTSP (FFmpeg directo) ...
-  → color  1920×1080 @ 1100kbps → puerto 8554
-  → depth  1280×720  @ 500kbps  → puerto 8555
-  → ir1    1280×720  @ 200kbps  → puerto 8556
-  → ir2    1280×720  @ 200kbps  → puerto 8557
+[5/6] Iniciando 4 publicadores FFmpeg → MediaMTX ...
+  → color  1920×1080 @ 1100kbps → rtsp://127.0.0.1:8554/color
+  → depth  1280×720 @ 500kbps → rtsp://127.0.0.1:8554/depth
+  → ir1    1280×720 @ 200kbps → rtsp://127.0.0.1:8554/ir1
+  → ir2    1280×720 @ 200kbps → rtsp://127.0.0.1:8554/ir2
 
-[5/5] Grabación local MKV en emisor: desactivada (se realiza en el receptor)
+[6/6] Grabación local en emisor: solo si se usa --grabar-rango
 
 ══════════════════════════════════════════════════════════════
-  ✓ TRANSMISIÓN ACTIVA — 4 Canales RTSP + LSB
+  ✓ TRANSMISIÓN ACTIVA — 4 Canales RTSP con LSB (MediaMTX)
 ──────────────────────────────────────────────────────────────
-  Color (RGB):     rtsp://192.168.1.42:8554/stream
-  Profundidad:     rtsp://192.168.1.42:8555/stream
-  Infrarrojo 1:    rtsp://192.168.1.42:8556/stream
-  Infrarrojo 2:    rtsp://192.168.1.42:8557/stream
+  Color (RGB):     rtsp://192.168.1.42:8554/color
+  Profundidad:     rtsp://192.168.1.42:8554/depth
+  Infrarrojo 1:    rtsp://192.168.1.42:8554/ir1
+  Infrarrojo 2:    rtsp://192.168.1.42:8554/ir2
 ──────────────────────────────────────────────────────────────
-  LSB:  128 bits × 1px/bit = 128px en fila 0
-  Receptor:  python3 receptor_ubuntu.py 192.168.1.42
-  VLC:       vlc rtsp://192.168.1.42:8554/stream
+  LSB: 8 px/bit × 128 bits = 1024 px en fila 0
+──────────────────────────────────────────────────────────────
+  Receptor: python3 receptor_ubuntu.py 192.168.1.42
+  VLC:      vlc rtsp://192.168.1.42:8554/color
 ══════════════════════════════════════════════════════════════
 ```
 
@@ -480,8 +491,8 @@ Deberías ver:
 **Opciones del emisor:**
 
 ```bash
-python3 emisor_ubuntu.py --puerto 8554       # Puerto RTSP base (defecto: 8554)
-python3 emisor_ubuntu.py --cam 1             # Segunda cámara
+python3 emisor_ubuntu.py --puerto 8554       # Puerto RTSP de MediaMTX (defecto: 8554)
+python3 emisor_ubuntu.py --cam 1             # Usar segunda cámara
 python3 emisor_ubuntu.py --calidad 4000      # Mayor calidad (kbps)
 python3 emisor_ubuntu.py --listar-camaras    # Ver cámaras RealSense
 python3 emisor_ubuntu.py --diagnostico       # Diagnóstico completo
@@ -508,12 +519,12 @@ El receptor se conectará a los 4 canales y mostrará un mosaico interactivo:
 
 ```
 ══════════════════════════════════════════════════════════════
-  RECEPTOR RTSP — RealSense D435 · Ubuntu Nativo (v4 · LSB)
+  RECEPTOR RTSP — RealSense D435 · Ubuntu Nativo (v6 · LSB · MediaMTX)
 ══════════════════════════════════════════════════════════════
-  color  → rtsp://192.168.1.42:8554/stream
-  depth  → rtsp://192.168.1.42:8555/stream
-  ir1    → rtsp://192.168.1.42:8556/stream
-  ir2    → rtsp://192.168.1.42:8557/stream
+  color  → rtsp://192.168.1.42:8554/color
+  depth  → rtsp://192.168.1.42:8554/depth
+  ir1    → rtsp://192.168.1.42:8554/ir1
+  ir2    → rtsp://192.168.1.42:8554/ir2
 ──────────────────────────────────────────────────────────────
   Grabación MKV: /ruta/a/donde/guardar/video.mkv
   Controles: [M]osaico [1]Color [2]IR1 [3]Depth [4]IR2
@@ -540,7 +551,7 @@ El receptor se conectará a los 4 canales y mostrará un mosaico interactivo:
 python3 receptor_ubuntu.py 192.168.1.42             # IP con puerto base defecto (8554)
 python3 receptor_ubuntu.py --grabar 192.168.1.42    # Graba en grabacion.mkv en el receptor
 python3 receptor_ubuntu.py --grabar /ruta/video.mkv 192.168.1.42 # Graba en la ruta especificada
-python3 receptor_ubuntu.py 192.168.1.42 9554        # Puerto base personalizado
+python3 receptor_ubuntu.py 192.168.1.42 8554        # Puerto base personalizado
 python3 receptor_ubuntu.py --sin-hud 192.168.1.42   # Sin overlay de info
 python3 receptor_ubuntu.py 127.0.0.1                # Prueba local
 ```
@@ -548,15 +559,15 @@ python3 receptor_ubuntu.py 127.0.0.1                # Prueba local
 ### Paso 3: Detener
 
 - **Receptor:** presiona `Q` o `ESC` en la ventana, o `Ctrl+C` en la terminal.
-- **Emisor:** presiona `Ctrl+C` en la terminal. Libera cámara y FFmpeg automáticamente.
+- **Emisor:** presiona `Ctrl+C` en la terminal. Libera cámara, FFmpeg y MediaMTX automáticamente.
 
 ### Verificar con VLC (opcional — Ubuntu)
 
 ```bash
-vlc rtsp://192.168.1.42:8554/stream
+vlc rtsp://192.168.1.42:8554/color
 ```
 
-O desde la interfaz gráfica: **Medio → Abrir ubicación de red** → `rtsp://192.168.1.42:8554/stream`
+O desde la interfaz gráfica: **Medio → Abrir ubicación de red** → `rtsp://192.168.1.42:8554/color`
 
 ---
 
@@ -610,11 +621,11 @@ python3 receptor_ubuntu.py 192.168.1.42
 
 ### "Puerto en uso" o "Error al iniciar servidor RTSP"
 
-Los puertos 8554-8557 ya están en uso:
+El puerto 8554 ya está en uso:
 ```bash
 # Ubuntu:
 sudo lsof -i :8554
-# Usar otros puertos base:
+# Usar otro puerto base:
 python3 emisor_ubuntu.py --puerto 9554
 ```
 
@@ -634,22 +645,23 @@ python emisor.py --puerto 9554
 
 # ⚙️ Explicación Técnica Detallada
 
-1. **Servidor RTSP integrado en FFmpeg**: Cada proceso FFmpeg actúa como servidor RTSP directo usando `-rtsp_flags listen`. El emisor lanza 4 instancias (una por canal), cada una escuchando en un puerto TCP dedicado. No se requiere ningún intermediario externo.
+1. **Servidor RTSP central (MediaMTX)**: Un único binario de MediaMTX es descargado y ejecutado en el emisor de forma automática. Actúa como servidor centralizado. Los publicadores FFmpeg empujan los datos codificados por sockets TCP a MediaMTX. El receptor se conecta a este y consume los flujos.
 2. **Procesamiento de Imágenes**: 
    - La profundidad se convierte a un mapa de calor usando `cv2.COLORMAP_JET`.
-   - Las resoluciones nativas (RGB 1080p y Depth/IR 720p) se redimensionan y concatenan matemáticamente usando `numpy` en un lienzo de `1920x1440`.
-3. **Compresión H.264 (FFmpeg)**: El lienzo en crudo pasa por una tubería (pipe) hacia FFmpeg, configurado con el preset `ultrafast` y `zerolatency` para empujar los paquetes vía RTP/TCP.
+   - Las resoluciones nativas (RGB 1080p y Depth/IR 720p) se redimensionan y concatenan matemáticamente usando `numpy` en un lienzo de `1920x1440` en el receptor.
+3. **Compresión H.264 (FFmpeg)**: El lienzo en crudo de la cámara pasa por una tubería (pipe) hacia FFmpeg, configurado con el preset `ultrafast` y `tune zerolatency` para empujar los paquetes de vídeo vía RTP/TCP a MediaMTX con latencia inferior a 150ms.
 
 ---
 
 # 📁 Estructura del proyecto
 
 ```text
-Demo RTSP/
+Formato-RTSP/
 ├── emisor.py                  # Emisor para Windows nativo (v4 — FFmpeg RTSP Server directo)
-├── emisor_ubuntu.py           # Emisor para Ubuntu nativo (v4 — FFmpeg RTSP Server directo)
+├── emisor_ubuntu.py           # Emisor para Ubuntu nativo (v6 — MediaMTX + FFmpeg push)
+├── emisor_jetson.py           # Emisor para Jetson Orin (ARM64 — MediaMTX + FFmpeg push)
 ├── receptor.py                # Receptor para Windows nativo (v4 — HUD y verificación LSB)
-├── receptor_ubuntu.py         # Receptor para Ubuntu nativo (v4 — HUD y verificación LSB)
+├── receptor_ubuntu.py         # Receptor para Ubuntu nativo (v6 — HUD y verificación LSB con MediaMTX)
 ├── DOCUMENTACION_TECNICA.md   # Documentación detallada de esteganografía LSB y resiliencia MKV
 ├── requirements.txt           # Dependencias Python (Windows)
 ├── requirements_ubuntu.txt    # Dependencias Python (Ubuntu)
