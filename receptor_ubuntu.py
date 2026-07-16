@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """
-Receptor RTSP Multicanal — Ubuntu/Linux Nativo (v4).
+Receptor RTSP Multicanal — Ubuntu/Linux Nativo (v5).
 
-Rediseñado con extracción de esteganografía LSB para verificación de sincronía.
+Extrae esteganografía LSB (8 px/bit, 1024 px totales) para verificación
+de sincronía entre los 4 canales. Compatible con emisor_ubuntu.py v5.
+
 Se conecta a 4 streams RTSP independientes del emisor RealSense D435
 (Color, Depth, IR1, IR2) y extrae los metadatos ocultos (Frame ID + Timestamp)
 para mostrar la sincronía real entre canales en el HUD.
@@ -61,7 +63,7 @@ except ImportError:
 # ═══════════════════════════════════════════════════════════════════════════
 
 PUERTO_RTSP_DEFECTO = 8554
-NOMBRE_VENTANA = "Receptor RTSP — RealSense D435 (Ubuntu v4 · LSB)"
+NOMBRE_VENTANA = "Receptor RTSP — RealSense D435 (Ubuntu v5 · LSB 8px/bit)"
 
 MOSAICO_ANCHO = 1920
 MOSAICO_ALTO = 1440
@@ -183,10 +185,14 @@ CANALES_INFO = {
 # ═══════════════════════════════════════════════════════════════════════════
 # ESTEGANOGRAFÍA LSB — EXTRACCIÓN
 # ═══════════════════════════════════════════════════════════════════════════
+#
+# CRÍTICO: BITS_POR_BLOQUE debe coincidir exactamente con emisor_ubuntu.py
+# Valor correcto: 8 (cada bit lógico se repite en 8 píxeles contiguos)
+# Total: 128 bits × 8 px/bit = 1024 píxeles en fila 0
 
-BITS_POR_BLOQUE = 8
-TOTAL_BITS = 128
-PIXELES_LSB = TOTAL_BITS * BITS_POR_BLOQUE  # 1024
+BITS_POR_BLOQUE = 8        # ← debe coincidir con emisor_ubuntu.py
+TOTAL_BITS      = 128
+PIXELES_LSB     = TOTAL_BITS * BITS_POR_BLOQUE  # = 1024
 
 
 def extraer_lsb(frame):
