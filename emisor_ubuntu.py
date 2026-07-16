@@ -612,6 +612,57 @@ def crear_ffmpeg(ruta_ffmpeg, puerto_listen, ancho, alto, pix_fmt, fps, bitrate_
     )
 
 
+def escribir_frame_ffmpeg(procesos_ff, nombre, datos_bytes,
+                          ruta_ffmpeg, puerto, ancho, alto, pix_fmt, fps, bitrate_kbps):
+    """
+    Escribe datos raw a stdin del proceso FFmpeg indicado.
+    Si el proceso ha muerto (BrokenPipe o poll() != None), lo reinicia
+    automáticamente y espera 1 s para que el socket de escucha esté listo.
+
+    Retorna True si la escritura fue exitosa (o tras reinicio), False si
+    ocurrió un error irrecuperable.
+    """
+    proc = procesos_ff.get(nombre)
+
+    # Detectar proceso caído antes de escribir
+    if proc is None or proc.poll() is not None:
+        print(f"  ↺ FFmpeg ({nombre}) caído/no iniciado — reiniciando ...")
+        try:
+            if proc and proc.stdin:
+                try:
+                    proc.stdin.close()
+                except Exception:
+                    pass
+            procesos_ff[nombre] = crear_ffmpeg(
+                ruta_ffmpeg, puerto, ancho, alto, pix_fmt, fps, bitrate_kbps)
+            time.sleep(1.0)   # Dar tiempo al socket RTSP
+            proc = procesos_ff[nombre]
+        except Exception as e:
+            print(f"  ✗ No se pudo reiniciar FFmpeg ({nombre}): {e}")
+            return False
+
+    try:
+        proc.stdin.write(datos_bytes)
+        proc.stdin.flush()
+        return True
+    except (BrokenPipeError, OSError):
+        # El cliente RTSP se desconectó o aún no se ha conectado ninguno:
+        # FFmpeg cierra stdin al perder la conexión saliente.
+        # Reiniciar para que vuelva a escuchar conexiones nuevas.
+        print(f"  ↺ FFmpeg ({nombre}) — pipe roto, reiniciando para esperar nueva conexión ...")
+        try:
+            proc.wait(timeout=2)
+        except Exception:
+            proc.kill()
+        try:
+            procesos_ff[nombre] = crear_ffmpeg(
+                ruta_ffmpeg, puerto, ancho, alto, pix_fmt, fps, bitrate_kbps)
+            time.sleep(1.0)
+        except Exception as e:
+            print(f"  ✗ No se pudo reiniciar FFmpeg ({nombre}): {e}")
+        return True   # Continuar el bucle aunque se haya perdido este frame
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # FUNCIÓN PRINCIPAL DEL EMISOR
 # ═══════════════════════════════════════════════════════════════════════════
@@ -729,7 +780,7 @@ def iniciar_emisor(indice_camara=0, puerto=PUERTO_RTSP_DEFECTO,
             )
 
         # Dar tiempo a FFmpeg para abrir los sockets de escucha
-        time.sleep(2)
+        time.sleep(3)
 
         # ── PASO 5: Grabación de rango (opcional) ────────────────────────
         print("\n[5/5] Grabación local en emisor: solo si se usa --grabar-rango")
@@ -809,15 +860,31 @@ def iniciar_emisor(indice_camara=0, puerto=PUERTO_RTSP_DEFECTO,
             inyectar_lsb(ir1_img,     frame_id, timestamp_ns)
             inyectar_lsb(ir2_img,     frame_id, timestamp_ns)
 
-            # Enviar a los 4 FFmpeg RTSP
-            try:
-                procesos_ff["color"].stdin.write(color_img.tobytes())
-                procesos_ff["depth"].stdin.write(depth_color.tobytes())
-                procesos_ff["ir1"].stdin.write(ir1_img.tobytes())
-                procesos_ff["ir2"].stdin.write(ir2_img.tobytes())
-            except (BrokenPipeError, OSError) as e:
-                print(f"  ✗ Error escribiendo a FFmpeg RTSP: {e}")
-                break
+            # Enviar a los 4 FFmpeg RTSP (con reinicio automático si el pipe se rompe)
+            escribir_frame_ffmpeg(
+                procesos_ff, "color", color_img.tobytes(),
+                ruta_ffmpeg, puertos["color"],
+                canales["color"]["ancho"], canales["color"]["alto"],
+                canales["color"]["pix"], 30, canales["color"]["br"]
+            )
+            escribir_frame_ffmpeg(
+                procesos_ff, "depth", depth_color.tobytes(),
+                ruta_ffmpeg, puertos["depth"],
+                canales["depth"]["ancho"], canales["depth"]["alto"],
+                canales["depth"]["pix"], 30, canales["depth"]["br"]
+            )
+            escribir_frame_ffmpeg(
+                procesos_ff, "ir1", ir1_img.tobytes(),
+                ruta_ffmpeg, puertos["ir1"],
+                canales["ir1"]["ancho"], canales["ir1"]["alto"],
+                canales["ir1"]["pix"], 30, canales["ir1"]["br"]
+            )
+            escribir_frame_ffmpeg(
+                procesos_ff, "ir2", ir2_img.tobytes(),
+                ruta_ffmpeg, puertos["ir2"],
+                canales["ir2"]["ancho"], canales["ir2"]["alto"],
+                canales["ir2"]["pix"], 30, canales["ir2"]["br"]
+            )
 
             # Grabación de rango sin pérdidas
             if grabador_rango is not None:
@@ -842,12 +909,8 @@ def iniciar_emisor(indice_camara=0, puerto=PUERTO_RTSP_DEFECTO,
                 print(f"  📹 FID: {frame_id - 1}  TS: {ts_str}.{ts_ms:03d}"
                       f"  FPS: {fps_actual:.1f}  Tiempo: {dt:.0f}s")
 
-            # Vigilar que los FFmpeg sigan vivos
-            for nombre, proc in procesos_ff.items():
-                if proc.poll() is not None:
-                    print(f"  ✗ FFmpeg ({nombre}) se detuvo inesperadamente.")
-                    _cerrando = True
-                    break
+            # Nota: ya no vigilamos si FFmpeg muere para detener el bucle;
+            # escribir_frame_ffmpeg lo reinicia automáticamente.
 
     except KeyboardInterrupt:
         print("\n\n  ⏹ Detenido por el usuario (Ctrl+C).")
