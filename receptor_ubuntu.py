@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
 """
-Receptor RTSP Multicanal — Ubuntu/Linux Nativo (v5).
+Receptor RTSP Multicanal — Ubuntu/Linux Nativo (v6).
 
 Extrae esteganografía LSB (8 px/bit, 1024 px totales) para verificación
-de sincronía entre los 4 canales. Compatible con emisor_ubuntu.py v5.
+de sincronía entre los 4 canales. Compatible con emisor_ubuntu.py v6.
 
-Se conecta a 4 streams RTSP independientes del emisor RealSense D435
+Se conecta a 4 streams RTSP del emisor RealSense D435 vía MediaMTX
 (Color, Depth, IR1, IR2) y extrae los metadatos ocultos (Frame ID + Timestamp)
 para mostrar la sincronía real entre canales en el HUD.
 
-Cada canal usa un puerto RTSP dedicado (FFmpeg RTSP Server directo, sin MediaMTX):
-  rtsp://<IP>:8554/stream  — Color (RGB)
-  rtsp://<IP>:8555/stream  — Profundidad
-  rtsp://<IP>:8556/stream  — Infrarrojo 1
-  rtsp://<IP>:8557/stream  — Infrarrojo 2
+Todos los canales usan el mismo puerto RTSP con rutas distintas (MediaMTX):
+  rtsp://<IP>:8554/color  — Color (RGB)
+  rtsp://<IP>:8554/depth  — Profundidad
+  rtsp://<IP>:8554/ir1    — Infrarrojo 1
+  rtsp://<IP>:8554/ir2    — Infrarrojo 2
 
 Controles de teclado:
   m  → Mosaico (4 vistas combinadas)
@@ -494,14 +494,14 @@ def iniciar_receptor(ip, puerto, mostrar_hud=True, ruta_grabacion=None):
     sincronía real en el HUD.
     """
     urls = {
-        "color": f"rtsp://{ip}:{puerto}/stream",
-        "depth": f"rtsp://{ip}:{puerto + 1}/stream",
-        "ir1":   f"rtsp://{ip}:{puerto + 2}/stream",
-        "ir2":   f"rtsp://{ip}:{puerto + 3}/stream",
+        "color": f"rtsp://{ip}:{puerto}/color",
+        "depth": f"rtsp://{ip}:{puerto}/depth",
+        "ir1":   f"rtsp://{ip}:{puerto}/ir1",
+        "ir2":   f"rtsp://{ip}:{puerto}/ir2",
     }
 
     print("\n" + "═" * 62)
-    print("  RECEPTOR RTSP — RealSense D435 · Ubuntu Nativo (v4 · LSB)")
+    print("  RECEPTOR RTSP — RealSense D435 · Ubuntu Nativo (v6 · LSB · MediaMTX)")
     print("═" * 62)
     for nombre, url in urls.items():
         print(f"  {nombre:<6} → {url}")
@@ -769,18 +769,18 @@ if __name__ == "__main__":
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Ejemplos:
-  python3 receptor_ubuntu.py 192.168.1.42             # IP del emisor (puerto base 8554)
-  python3 receptor_ubuntu.py 192.168.1.42 9554        # Puerto base personalizado
+  python3 receptor_ubuntu.py 192.168.1.42             # IP del emisor (puerto 8554)
+  python3 receptor_ubuntu.py 192.168.1.42 9554        # Puerto personalizado
   python3 receptor_ubuntu.py --sin-hud 192.168.1.42   # Sin overlay de info
   python3 receptor_ubuntu.py --grabar 192.168.1.42    # Graba en grabacion.mkv
   python3 receptor_ubuntu.py --grabar video.mkv 192.168.1.42 # Graba en ruta específica
   python3 receptor_ubuntu.py 127.0.0.1                # Prueba local
 
-Puertos RTSP (base + offset):
-  Color:  base     (ej. 8554)
-  Depth:  base + 1 (ej. 8555)
-  IR1:    base + 2 (ej. 8556)
-  IR2:    base + 3 (ej. 8557)
+URLs RTSP (un solo puerto, 4 rutas vía MediaMTX):
+  Color:  rtsp://IP:8554/color
+  Depth:  rtsp://IP:8554/depth
+  IR1:    rtsp://IP:8554/ir1
+  IR2:    rtsp://IP:8554/ir2
 
 Controles en la ventana:
   M → Mosaico (4 vistas)    1 → Color    2 → IR1
