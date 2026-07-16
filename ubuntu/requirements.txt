@@ -1,0 +1,13 @@
+# Dependencias Python para Ubuntu/Linux
+#
+# Instalar con: pip install -r requirements.txt
+#
+# Paquetes del sistema necesarios:
+#   sudo apt install ffmpeg python3-venv python3-pip libgl1 libglib2.0-0
+#
+# Para verificar que todo está instalado:
+#   python3 verificar_sistema.py
+
+opencv-python
+numpy
+pyrealsense2
