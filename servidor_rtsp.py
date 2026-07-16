@@ -190,6 +190,8 @@ class AdministradorRTSP:
             "-maxrate", f"{bitrate_kbps}k",
             "-bufsize", f"{bitrate_kbps * 2}k",
             "-g", str(fps * 2),                 # GOP de 2s
+            "-an",                              # Desactivar audio explícitamente para evitar malas interpretaciones del códec
+            "-flags:v", "+global_header",       # Escribir cabeceras globales H.264 (SPS/PPS) en el SDP
             "-f", "rtsp",
             "-rtsp_transport", "tcp",
             url_destino
