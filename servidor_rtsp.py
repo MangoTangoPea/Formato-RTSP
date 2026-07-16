@@ -162,10 +162,14 @@ class AdministradorRTSP:
 
         print(f"  → Levantando servidor MediaMTX en el puerto {self.puerto_rtsp} ...")
         try:
+            log_path = os.path.join(self.dir_logs, "mediamtx.log")
+            log_file = open(log_path, "w", encoding="utf-8")
+            self.log_files["mediamtx"] = log_file
+
             self.proceso_mediamtx = subprocess.Popen(
                 [exe_path],
                 cwd=DIR_MEDIAMTX,
-                stdout=subprocess.PIPE,
+                stdout=log_file,
                 stderr=subprocess.STDOUT,
                 env=entorno
             )
@@ -175,7 +179,11 @@ class AdministradorRTSP:
         # Comprobar que no haya muerto inmediatamente
         time.sleep(2)
         if self.proceso_mediamtx.poll() is not None:
-            salida = self.proceso_mediamtx.stdout.read().decode(errors="replace")[:400]
+            try:
+                with open(log_path, "r", encoding="utf-8") as lf:
+                    salida = lf.read()[:400]
+            except Exception:
+                salida = "No se pudo leer el log de MediaMTX."
             raise RuntimeError(f"MediaMTX falló al iniciar. Log:\n{salida}")
 
         print(f"  ✓ MediaMTX corriendo correctamente (PID: {self.proceso_mediamtx.pid})")
@@ -290,14 +298,6 @@ class AdministradorRTSP:
                             pass
         self.procesos_ff.clear()
 
-        # Cerrar manejadores de archivos de log
-        for canal, log_file in self.log_files.items():
-            try:
-                log_file.close()
-            except Exception:
-                pass
-        self.log_files.clear()
-
         if self.proceso_mediamtx:
             print("  → Deteniendo servidor MediaMTX...")
             if self.proceso_mediamtx.poll() is None:
@@ -310,4 +310,13 @@ class AdministradorRTSP:
                     except Exception:
                         pass
             self.proceso_mediamtx = None
+
+        # Cerrar manejadores de archivos de log después de detener los procesos
+        for canal, log_file in list(self.log_files.items()):
+            try:
+                log_file.close()
+            except Exception:
+                pass
+        self.log_files.clear()
+
         print("  ✓ Todos los servicios RTSP y codificadores detenidos.")
