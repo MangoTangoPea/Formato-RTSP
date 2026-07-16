@@ -117,16 +117,34 @@ def descargar_mediamtx():
     print(f"  ✓ MediaMTX instalado en: {exe_path}")
     return exe_path
 
+def limpiar_procesos_anteriores():
+    """Intenta matar cualquier proceso previo de mediamtx o ffmpeg para liberar puertos y recursos."""
+    print("  → Limpiando procesos mediamtx y ffmpeg previos...")
+    try:
+        if sys.platform.startswith("linux"):
+            subprocess.run(["killall", "-9", "mediamtx"], capture_output=True, timeout=5)
+            subprocess.run(["killall", "-9", "ffmpeg"], capture_output=True, timeout=5)
+    except Exception:
+        pass
+
 class AdministradorRTSP:
     def __init__(self, puerto_rtsp=8554):
         self.puerto_rtsp = puerto_rtsp
         self.proceso_mediamtx = None
         self.procesos_ff = {}
+        self.log_files = {}  # Para guardar referencias de archivos de log y cerrarlos limpiamente
         self.ruta_ffmpeg = None
         self.activo = False
 
+        # Asegurar directorio de logs
+        self.dir_logs = os.path.join(DIR_BASE, "logs")
+        os.makedirs(self.dir_logs, exist_ok=True)
+
     def iniciar_servidor(self):
         """Descarga e inicia MediaMTX en el puerto seleccionado."""
+        # Limpieza previa de puertos y procesos colgados
+        limpiar_procesos_anteriores()
+
         # Buscar FFmpeg primero
         self.ruta_ffmpeg, origen = buscar_ffmpeg()
         if not self.ruta_ffmpeg:
@@ -167,6 +185,7 @@ class AdministradorRTSP:
         """
         Lanza un proceso FFmpeg en modo PUSH.
         Toma frames raw desde stdin y los empuja a MediaMTX vía TCP.
+        Redirige stderr a un archivo de log para evitar bloqueos por buffer.
         """
         if not self.activo:
             return False
@@ -198,11 +217,15 @@ class AdministradorRTSP:
         ]
 
         try:
+            log_path = os.path.join(self.dir_logs, f"ffmpeg_{canal}.log")
+            log_file = open(log_path, "w", encoding="utf-8")
+            self.log_files[canal] = log_file
+
             proc = subprocess.Popen(
                 cmd,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE
+                stderr=log_file
             )
             self.procesos_ff[canal] = proc
             return True
@@ -227,12 +250,21 @@ class AdministradorRTSP:
         """Verifica si todos los publicadores FFmpeg siguen vivos."""
         for canal, proc in list(self.procesos_ff.items()):
             if proc.poll() is not None:
-                # El proceso terminó de forma prematura, leemos el error
+                log_path = os.path.join(self.dir_logs, f"ffmpeg_{canal}.log")
+                print(f"  ✗ El publicador del canal '{canal}' se detuvo inesperadamente.")
+                print(f"    Consulte el log detallado en: {log_path}")
+                
+                # Intentar leer las últimas líneas del log para mostrar al usuario
                 try:
-                    err = proc.stderr.read().decode(errors="replace")[:200]
+                    if os.path.exists(log_path):
+                        with open(log_path, "r", encoding="utf-8") as lf:
+                            lineas = lf.readlines()
+                            if lineas:
+                                print("    Últimas líneas del log:")
+                                for l in lineas[-5:]:
+                                    print(f"      {l.strip()}")
                 except Exception:
-                    err = "No se pudo leer stderr."
-                print(f"  ✗ El publicador del canal '{canal}' se detuvo. Detalle:\n{err}")
+                    pass
                 return False
         return True
 
@@ -257,6 +289,14 @@ class AdministradorRTSP:
                         except Exception:
                             pass
         self.procesos_ff.clear()
+
+        # Cerrar manejadores de archivos de log
+        for canal, log_file in self.log_files.items():
+            try:
+                log_file.close()
+            except Exception:
+                pass
+        self.log_files.clear()
 
         if self.proceso_mediamtx:
             print("  → Deteniendo servidor MediaMTX...")
